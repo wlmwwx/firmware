@@ -19,3 +19,11 @@ CLAUDE.local.md
 # accidental .pyc widened a docs pull request to the full 99-board matrix.
 __pycache__/
 *.pyc
+
+# Host-side developer tooling that drives a single camera. Never belongs in a
+# pull request: the file paths / u-boot offsets / board-specific assumptions
+# only resolve on the desk of whoever owns the board, and a fix there cannot
+# be reviewed against the OpenIPC build that ships on it. If something here
+# proves useful to other developers of the same board, lift the relevant lines
+# into the right place (br-ext-chip-<vendor>/scripts or general/...) and PR.
+scripts-host/

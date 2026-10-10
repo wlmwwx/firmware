@@ -19,6 +19,8 @@ fi
 
 # Generic RTL8188FU
 if [ "$1" = "rtl8188fu-generic" ]; then
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -72,6 +74,8 @@ fi
 # GK7205V200 Kafei
 if [ "$1" = "8188fu-gk7205v200-kafei" ]; then
 	set_gpio 57 0
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -124,6 +128,8 @@ fi
 # HI3518EV200 LifeSmart
 if [ "$1" = "rtl8188fu-hi3518ev200-lifesmart" ]; then
 	set_gpio 54 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -131,6 +137,8 @@ fi
 # HI3518EV200 Switcam HS303 (V1)
 if [ "$1" = "rtl8188fu-switcam-hs303" ]; then
 	set_gpio 3 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -160,6 +168,8 @@ fi
 if [ "$1" = "rtl8188fu-hi3518ev300-unknown1" ]; then
 	set_gpio 57 0
 	modprobe mac80211
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -167,6 +177,8 @@ fi
 # HI3518EV300 t5810hct-m02
 if [ "$1" = "rtl8188fu-hi3518ev300-t5810hct-m02" ]; then
 	set_gpio 40 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -174,6 +186,8 @@ fi
 # SSC325DE IMOU C22EP-S2
 if [ "$1" = "rtl8188fu-ssc325de-imou-c22ep-s2" ]; then
 	set_gpio 62 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -181,6 +195,8 @@ fi
 # SSC335DE IMOU C22E-S2 V2
 if [ "$1" = "rtl8188fu-ssc335de-imou-c22e-s2-v2" ]; then
 	set_gpio 14 0
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -188,6 +204,8 @@ fi
 # SSC333 Babysense See HD IP206
 if [ "$1" = "rtl8188fu-babysense-see-hd-ip206" ]; then
 	set_gpio 14 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -195,6 +213,8 @@ fi
 # SSC333 Meari Speed 6S
 if [ "$1" = "rtl8188fu-ssc333-meari-speed-6s" ]; then
 	set_gpio 14 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -216,6 +236,8 @@ fi
 # SSC335DE Uniview C1L-2WN-G
 if [ "$1" = "rtl8188fu-ssc335de-uniview-c1l-2wn-g" ]; then
 	set_gpio 1 0
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -229,6 +251,8 @@ fi
 # SSC337DE BroadbandService
 if [ "$1" = "rtl8188fu-ssc337de-broadband" ]; then
 	set_gpio 2 0
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -236,6 +260,8 @@ fi
 # SSC337DE Foscam
 if [ "$1" = "rtl8188fu-ssc337de-foscam" ]; then
 	set_gpio 15 0
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -257,6 +283,8 @@ fi
 # T21 BJS
 if [ "$1" = "rtl8188fu-t21-bjs" ]; then
 	set_gpio 50 0
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -264,6 +292,8 @@ fi
 # T21 Smartwares
 if [ "$1" = "rtl8188fu-t21-smartwares" ]; then
 	set_gpio 49 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -271,6 +301,8 @@ fi
 # T31 Aoni EP01J05
 if [ "$1" = "rtl8188fu-t31-aoni-ep01j05" ]; then
 	set_gpio 43 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -278,6 +310,8 @@ fi
 # T31 Aosu C5L
 if [ "$1" = "rtl8188fu-t31-aosu-c5l" ]; then
 	set_gpio 43 0
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -306,6 +340,8 @@ fi
 # T31 iFlytek XFP301-M
 if [ "$1" = "rtl8188fu-t31-iflytek-xfp301m" ]; then
 	set_gpio 10 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
 	exit 0
 fi
@@ -320,6 +356,8 @@ fi
 # T31 Aoni E97VJ62
 if [ "$1" = "rtl8188fu-t31-aoni-e97vj62" ]; then
 	set_gpio 53 1
+	modprobe cfg80211
+	modprobe mac80211
 	modprobe 8188fu
   exit 0
 fi
