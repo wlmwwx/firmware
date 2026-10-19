@@ -192,6 +192,8 @@ bash .github/scripts/test_sysupgrade.sh                       # sysupgrade rootf
 bash .github/scripts/test_check_mac.sh                        # the MAC the camera gives itself
 bash .github/scripts/test_excludes_report.sh                  # excludes lists report stale entries
 bash .github/scripts/test_ca_bundle_lite.sh                   # lite CA bundle keeps the roots it must
+bash .github/scripts/test_network_failover.sh                 # cable-primary networking, carrier watcher
+bash .github/scripts/test_init_overlay.sh                     # init never erases an overlay it cannot mount
 STRICT=1 bash .github/scripts/test_shell_parse.sh             # every shipped script parses
 STRICT=1 bash .github/scripts/test_strip_shell_comments.sh    # ...and still parses once stripped
 python3 .github/scripts/ci-matrix.py --self-test              # the selector agrees with the tree
@@ -206,6 +208,15 @@ in its own header, and `build-summary.py --self-test` only matters if you edit `
 
 ```sh
 git diff --name-only origin/master | python3 .github/scripts/ci-matrix.py --stdin
+```
+
+A change to `general/package/Config.in` builds every board unless the selector can see that it
+only adds or drops `source` lines. CI reads that from the pull request's diff. To get the same
+answer locally, pass the diff:
+
+```sh
+git diff origin/master -- general/package/Config.in > /tmp/index.diff
+git diff --name-only origin/master | python3 .github/scripts/ci-matrix.py --stdin --index-diff /tmp/index.diff
 ```
 
 ### With a camera

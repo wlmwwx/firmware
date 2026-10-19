@@ -70,6 +70,91 @@ EOF
 	return 1
 }
 
+# True when rootfs_data holds this firmware's own settings, which must never
+# be erased just because this kernel cannot read them.
+#
+# jffs2 keeps a file's name uncompressed in its directory-entry node, so these
+# names are visible in the raw partition, and they are OpenIPC's own:
+# .openipc-overlay, which this script writes the first time it mounts the
+# overlay (below), before anything can put a setting there; eula-accepted and
+# majestic.yaml, which claiming the camera and saving a setting write -- they
+# cover an overlay made before that marker existed; and fake-hwclock.data,
+# which every camera saves on its own. An entry deleted since is still there
+# until jffs2 reclaims its block, which only makes the answer more often yes.
+#
+# What this protects: a kernel built without an option the overlay was written
+# with refuses the whole filesystem -- an xattr node is JFFS2_FEATURE_INCOMPAT,
+# so a kernel without CONFIG_JFFS2_FS_XATTR fails the mount ("Incompatible
+# feature node") -- and the branch below then erased it. That took every
+# setting and the root password with it on an XM510 moved from a kernel with
+# xattrs to one without (#2606 turned them on there). Reads only.
+# Settings an upgrade moved. On the split NOR layout (one "firmware" partition
+# the kernel divides at boot) an upgrade that changes the images moves where
+# rootfs_data starts, so sysupgrade stages the settings at the new start as
+# "OPENIPC-OVL1", a 12-digit length and a gzipped tar. Restore them into a
+# freshly erased overlay before it is mounted. Until the erase, a power cut
+# leaves the blob in place and the next boot does this again.
+overlay_carry_in() {
+	local chr=$1 blk=$2 len blocks
+	[ "$(dd if="$chr" bs=12 count=1 2>/dev/null)" = "OPENIPC-OVL1" ] || return 0
+	# Decimal with leading zeros, which $(( )) would read as octal.
+	len=$(dd if="$chr" bs=24 count=1 2>/dev/null | tail -c 12 | sed 's/^0*//')
+	len=${len:-0}
+	blocks=$(((24 + len + 65535) / 65536))
+	if [ "$len" -eq 0 ]; then
+		# sysupgrade -n: a clean overlay, nothing to restore.
+		echo "Clearing settings after an upgrade..."
+		flash_eraseall -j "$chr"
+		return 0
+	fi
+	echo "Restoring settings carried over by an upgrade..."
+	# Nothing is erased until the archive is whole and in RAM. Until then a
+	# failure keeps the blob for the next boot (return 1: the caller boots on
+	# a RAM overlay, so the jffs2 path never formats it away).
+	if ! mount -t tmpfs tmpfs /overlay; then
+		carry_report "no RAM to restore the carried-over settings into; trying again next boot"
+		return 1
+	fi
+	dd if="$chr" bs=65536 count=$blocks 2>/dev/null | tail -c +25 | head -c "$len" > /overlay/settings.tgz
+	if [ "$(wc -c < /overlay/settings.tgz)" -ne "$len" ]; then
+		umount /overlay
+		carry_report "could not read the carried-over settings; trying again next boot"
+		return 1
+	fi
+	# A damaged archive will not get better: say so, and leave rootfs_data to
+	# the usual mount, which formats what it cannot read.
+	if ! gunzip -c /overlay/settings.tgz | tar -t > /dev/null 2>&1; then
+		umount /overlay
+		carry_report "the carried-over settings are damaged; the camera starts from defaults"
+		return 0
+	fi
+	flash_eraseall -j "$chr"
+	if ! mount -t jffs2 "$blk" /mnt; then
+		carry_report "rootfs_data would not mount after the erase; the carried-over settings are lost"
+	elif gunzip -c /overlay/settings.tgz | tar -x -C /mnt; then
+		echo "Settings restored."
+		sync
+		umount /mnt
+	else
+		sync
+		umount /mnt
+		carry_report "the carried-over settings could not be unpacked in full"
+	fi
+	umount /overlay
+	return 0
+}
+
+carry_report() {
+	echo "$1"
+	echo "<3>init: $1" > /dev/kmsg 2>/dev/null
+}
+
+OVERLAY_MARK=.openipc-overlay
+overlay_is_ours() {
+	grep -qs -e "$OVERLAY_MARK" -e 'eula-accepted' -e 'majestic.yaml' \
+		-e 'fake-hwclock.data' "$1"
+}
+
 mount -t proc proc /proc || exit 1
 grep -q overlay /proc/filesystems || exit 1
 
@@ -101,21 +186,63 @@ if $is_flash_root; then
 		# Before anything touches rootfs_data: mounting jffs2 on a mirror is
 		# already a write, since the scan queues every block it cannot parse
 		# for erasure.
-		if ! grep -q 'nand' /proc/cmdline && flash_aliased; then
+		aliased=false
+		grep -q 'nand' /proc/cmdline || ! flash_aliased || aliased=true
+		carried=0
+		if ! grep -q 'nand' /proc/cmdline && ! $aliased; then
+			overlay_carry_in /dev/$mtdchrdev /dev/$mtdblkdev || carried=1
+		fi
+		if $aliased; then
 			echo "Flash is smaller than the kernel thinks: leaving it alone, settings will not persist."
 			if ! mount -t tmpfs tmpfs /overlay; then
 				echo "Cannot mount overlay."
 				exit 1
 			fi
-		elif ! mount -t jffs2 /dev/$mtdblkdev /overlay || dmesg | grep -q "jffs2.*: Magic bitmask.*not found"; then
-			mountpoint -q /overlay && umount /overlay
-			echo "Formatting flash..."
-			grep -q 'nand' /proc/cmdline || jffs2="-j"
-			flash_eraseall $jffs2 /dev/$mtdchrdev
-			if ! mount -t jffs2 /dev/$mtdblkdev /overlay && ! mount -t tmpfs tmpfs /overlay; then
+		elif [ "$carried" = 1 ]; then
+			# Settings staged by an upgrade are still waiting in rootfs_data;
+			# mounting it as jffs2 would format them away.
+			if ! mount -t tmpfs tmpfs /overlay; then
 				echo "Cannot mount overlay."
 				exit 1
 			fi
+		elif ! mount -t jffs2 /dev/$mtdblkdev /overlay || dmesg | grep -q "jffs2.*: Magic bitmask.*not found"; then
+			# The format below is for a partition that is not ours to keep: a
+			# vendor's leftovers on a camera just converted, or one that never
+			# held a filesystem. Our own overlay is kept either way. If it
+			# mounted, the complaint was about stray blocks -- a power cut in
+			# the middle of an erase leaves one -- and jffs2 reclaims those
+			# itself. If it did not, this kernel cannot read it, and erasing
+			# it would lose the settings for a kernel that can.
+			if overlay_is_ours /dev/$mtdchrdev; then
+				if ! mountpoint -q /overlay; then
+					# The kernel's own reason. 3.x prints the feature refusal with no
+					# "jffs2:" prefix, so it is matched by its words.
+					why=$(dmesg | grep -m1 -E "Incompatible feature node|jffs2.*(not mount|error)" | sed 's/^\[[^]]*\] //')
+					msg="rootfs_data holds this camera's settings, but this kernel cannot mount them${why:+ ($why)}. Leaving them untouched: settings are in RAM until a kernel that can read them boots, or 'firstboot' erases them."
+					echo "$msg"
+					echo "<3>init: $msg" > /dev/kmsg 2>/dev/null
+					if ! mount -t tmpfs tmpfs /overlay; then
+						echo "Cannot mount overlay."
+						exit 1
+					fi
+				fi
+			else
+				mountpoint -q /overlay && umount /overlay
+				echo "Formatting flash..."
+				grep -q 'nand' /proc/cmdline || jffs2="-j"
+				flash_eraseall $jffs2 /dev/$mtdchrdev
+				if ! mount -t jffs2 /dev/$mtdblkdev /overlay && ! mount -t tmpfs tmpfs /overlay; then
+					echo "Cannot mount overlay."
+					exit 1
+				fi
+			fi
+		fi
+		# Claim the partition the moment it is ours to write, so that
+		# overlay_is_ours() can recognise it before any setting is in it.
+		# Outside the overlayfs upper directory on kernels that have one, and
+		# a dot-file at / on the old overlayfs that uses /overlay itself.
+		if grep -q " /overlay jffs2 " /proc/mounts && [ ! -e "/overlay/$OVERLAY_MARK" ]; then
+			: > "/overlay/$OVERLAY_MARK"
 		fi
 	fi
 elif $is_nfs_root && grep -q ' ro ' /proc/cmdline; then

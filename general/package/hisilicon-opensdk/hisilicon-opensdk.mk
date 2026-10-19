@@ -5,7 +5,7 @@
 ################################################################################
 
 HISILICON_OPENSDK_SITE = $(call github,openipc,openhisilicon,$(HISILICON_OPENSDK_VERSION))
-HISILICON_OPENSDK_VERSION = 77992b6cc53450c90f8940ed06ca3dfdd3260237
+HISILICON_OPENSDK_VERSION = cffc152310bc42309327919453eba7e6d6752a38
 
 HISILICON_OPENSDK_LICENSE = GPL-3.0
 HISILICON_OPENSDK_LICENSE_FILES = LICENSE
@@ -32,6 +32,9 @@ endif
 ifeq ($(BR2_PACKAGE_HISILICON_OSDRV_HI3520DV200),y)
 HISILICON_OPENSDK_DEPENDENCIES += hisilicon-osdrv-hi3520dv200
 endif
+ifeq ($(BR2_PACKAGE_HISILICON_OSDRV_HI3536DV100),y)
+HISILICON_OPENSDK_DEPENDENCIES += hisilicon-osdrv-hi3536dv100
+endif
 ifeq ($(BR2_PACKAGE_HISILICON_OSDRV_HI3516CV6XX),y)
 HISILICON_OPENSDK_DEPENDENCIES += hisilicon-osdrv-hi3516cv6xx
 endif
@@ -40,6 +43,9 @@ HISILICON_OPENSDK_DEPENDENCIES += hisilicon-osdrv-hi3519dv500
 endif
 ifeq ($(BR2_PACKAGE_GOKE_OSDRV_GK7205V500),y)
 HISILICON_OPENSDK_DEPENDENCIES += goke-osdrv-gk7205v500
+endif
+ifeq ($(BR2_PACKAGE_GOKE_OSDRV_GK7206V100),y)
+HISILICON_OPENSDK_DEPENDENCIES += goke-osdrv-gk7206v100
 endif
 
 HISILICON_OPENSDK_MODULE_SUBDIRS = kernel
@@ -53,7 +59,10 @@ ifneq ($(OPENIPC_SOC_FAMILY),hi3516cv500)
 ifneq ($(OPENIPC_SOC_FAMILY),hi3516cv200)
 ifneq ($(OPENIPC_SOC_FAMILY),hi3516cv100)
 ifneq ($(OPENIPC_SOC_FAMILY),hi3516av100)
+# gk7206v100's region (OSD) module imports from tde, so tde stays.
+ifneq ($(OPENIPC_SOC_FAMILY),gk7206v100)
 HISILICON_OPENSDK_MODULE_MAKE_OPTS += DISABLE_TDE=1
+endif
 endif
 endif
 endif
@@ -94,9 +103,16 @@ else ifeq ($(OPENIPC_SOC_FAMILY),hi3519dv500)
 	HISILICON_OPENSDK_SDK_CODE = 0x3519D500
 endif
 
+# gk7206v100's dump tools link the vendor libxmedia_*.so, which
+# goke-osdrv-gk7206v100 stages; libraries/gk7206v100/dump_tools skips itself
+# when this is unset.
+ifeq ($(OPENIPC_SOC_FAMILY),gk7206v100)
+HISILICON_OPENSDK_LIB_MAKE_OPTS = XMEDIA_LIBDIR=$(STAGING_DIR)/usr/lib
+endif
+
 # for userspace libraries
 define HISILICON_OPENSDK_BUILD_CMDS
-	$(MAKE) $(TARGET_CONFIGURE_OPTS) CHIPARCH=$(OPENIPC_SOC_FAMILY) SDK_CODE=$(HISILICON_OPENSDK_SDK_CODE) -C $(@D)/libraries all
+	$(MAKE) $(TARGET_CONFIGURE_OPTS) CHIPARCH=$(OPENIPC_SOC_FAMILY) SDK_CODE=$(HISILICON_OPENSDK_SDK_CODE) $(HISILICON_OPENSDK_LIB_MAKE_OPTS) -C $(@D)/libraries all
 endef
 
 # hi3520dv200 mirror is kernel-only — no isp/sensor/mpi_neo userspace
@@ -104,6 +120,13 @@ endef
 # CHIPARCH, so the default `make all` would try every subdir and fail.
 # Override the build step to a no-op until the userspace mirror lands.
 ifeq ($(OPENIPC_SOC_FAMILY),hi3520dv200)
+define HISILICON_OPENSDK_BUILD_CMDS
+	@:
+endef
+endif
+# hi3536dv100 is kernel-only too: the SDK has no userspace source, and its
+# libraries ship from hisilicon-osdrv-hi3536dv100.
+ifeq ($(OPENIPC_SOC_FAMILY),hi3536dv100)
 define HISILICON_OPENSDK_BUILD_CMDS
 	@:
 endef
@@ -247,7 +270,8 @@ HISILICON_OPENSDK_SENSORS_hi3516cv6xx = \
 	smart_sc431hai/libsns_sc431hai \
 	smart_sc4336p/libsns_sc4336p \
 	smart_sc450ai/libsns_sc450ai \
-	smart_sc500ai/libsns_sc500ai
+	smart_sc500ai/libsns_sc500ai \
+	sony_imx335/libsns_imx335
 HISILICON_OPENSDK_SENSORS_hi3519dv500 = \
 	gst_412c/libsns_gst412c \
 	omnivision_os04a10/libsns_os04a10 \
@@ -265,7 +289,34 @@ HISILICON_OPENSDK_SENSORS_gk7205v500 = \
 	imagedesign_mis2008/libsns_mis2008 \
 	imagedesign_mis2009/libsns_mis2009 \
 	smart_sc223a/libsns_sc223a
+
+# gk7206v100 builds the GK7206 SDK's own drivers (sensor/gk7206v100) against
+# musl. Installed: the 2-5MP subset of what the SDK's sample_comm_isp.c
+# registers, which the 8MB lite rootfs has room for. All 52 build; add one
+# here when a board carries it.
+HISILICON_OPENSDK_SENSORS_gk7206v100 = \
+	galaxycore_gc2053/libsns_gc2053 \
+	galaxycore_gc2083/libsns_gc2083 \
+	galaxycore_gc4653/libsns_gc4653 \
+	galaxycore_gc4663/libsns_gc4663 \
+	smartsens_sc200ai/libsns_sc200ai \
+	smartsens_sc3338/libsns_sc3338 \
+	smartsens_sc4336/libsns_sc4336 \
+	smartsens_sc4336p/libsns_sc4336p \
+	smartsens_sc450ai/libsns_sc450ai \
+	smartsens_sc500ai/libsns_sc500ai \
+	sony_imx307/libsns_imx307
 HISILICON_OPENSDK_SENSORS = $(HISILICON_OPENSDK_SENSORS_$(OPENIPC_SOC_FAMILY))
+
+# hi3516cv6xx_lite is an 8 MB NOR part with a 5120 KB squashfs slot, and master
+# already fills 5119.32 KB of it (CI run 39116182919: "0KB left"). The IMX335
+# module is ~20 KB compressed and does not fit; 5 MP also needs osmem=64M, which
+# rules out most lite-class cv610 boards. hi3516cv6xx_ultimate is 16 MB and had
+# ~1.1 MB spare, so it keeps the sensor. Filtered here, at selection time, so an
+# image and its sysupgrade payload stay in step; a finalize-hook rm -f would not.
+ifeq ($(OPENIPC_SOC_MODEL)/$(OPENIPC_VARIANT),hi3516cv6xx/lite)
+HISILICON_OPENSDK_SENSORS := $(filter-out sony_imx335/libsns_imx335,$(HISILICON_OPENSDK_SENSORS))
+endif
 
 # fpv variant on V4 (hi3516ev200 + gk7205v200): restrict to the high-fps
 # Sony sensors only. FPV cameras are permanently paired with one sensor;
@@ -418,6 +469,7 @@ define HISILICON_OPENSDK_INSTALL_TARGET_CMDS
 	$(INSTALL) -m 644 $(@D)/kernel/open_rtc.ko           $(HISILICON_OPENSDK_KMOD_DST)/hi_rtc.ko
 	$(INSTALL) -m 644 $(@D)/kernel/open_wdt.ko           $(HISILICON_OPENSDK_KMOD_DST)/wdt.ko
 	$(INSTALL) -m 644 $(@D)/kernel/open_pwm.ko           $(HISILICON_OPENSDK_KMOD_DST)/pwm.ko
+	$(INSTALL) -m 644 $(@D)/kernel/open_adc.ko           $(HISILICON_OPENSDK_KMOD_DST)/hi_adc.ko
 	$(INSTALL) -m 644 $(@D)/kernel/open_acodec.ko        $(HISILICON_OPENSDK_KMOD_DST)/acodec.ko
 	for mod in base sys isp vpss venc h264e jpege rc chnl ive vda group sio \
 		ai ao aenc adec; do \
@@ -543,6 +595,19 @@ HISILICON_OPENSDK_KMOD_DST = $(TARGET_DIR)/lib/modules/$(HISILICON_OPENSDK_KVER)
 HISILICON_OPENSDK_XM_MODS = acodec adec aenc ai aio ao base chnl h264e h265e \
 	isp isp_sensor_i2c isp_sensor_spi ive jpege mipi_rx osal rc rgn sys \
 	sysconfig vedu venc vgs vi vpss wdt
+# Every V500-set die (GK7205V500/V510/V530, GK7202V330) has the NPU, which
+# GK7201V200 lacks. Its driver (open_npu) and libxmedia_npu.so are built from
+# source; ultimate images get the library, beside the SDK's libxmedia_cl.so
+# and libxmedia_ai.so that goke-osdrv-gk7205v500 installs.
+ifneq ($(OPENIPC_SOC_MODEL),gk7201v200)
+HISILICON_OPENSDK_XM_MODS += npu
+ifeq ($(OPENIPC_VARIANT),ultimate)
+define HISILICON_OPENSDK_INSTALL_NPU_LIB
+	$(INSTALL) -D -m 0644 $(@D)/libraries/xmedia_npu/libxmedia_npu.so \
+		$(TARGET_DIR)/usr/lib/libxmedia_npu.so
+endef
+endif
+endif
 define HISILICON_OPENSDK_INSTALL_TARGET_CMDS
 	$(INSTALL) -m 755 -d $(TARGET_DIR)/usr/lib/sensors
 	$(foreach s,$(HISILICON_OPENSDK_SENSORS), \
@@ -552,6 +617,41 @@ define HISILICON_OPENSDK_INSTALL_TARGET_CMDS
 	for mod in $(HISILICON_OPENSDK_XM_MODS); do \
 		$(INSTALL) -m 644 $(@D)/kernel/open_$${mod}.ko \
 			$(HISILICON_OPENSDK_KMOD_DST)/xm_$${mod}.ko || exit 1; \
+	done
+	$(HISILICON_OPENSDK_INSTALL_NPU_LIB)
+endef
+
+# For gk7206v100 (GK7206V1): install the open_*.ko as built, as for cv6xx --
+# load_goke reaches them with `modprobe open_<m>`, which resolves the
+# dependencies between them. Stripped as on cv6xx: Buildroot's
+# target-finalize leaves *.ko alone.
+#
+# Beside them goes libxmedia_msensor (the IMU API), built here from the SDK's
+# source rather than shipped by goke-osdrv-gk7206v100, and on ultimate
+# libxmedia_svp (the NPU detection framework) for user programs. The SDK's
+# VI/VPSS/VO dump tools are built too but not installed: capture tools belong
+# in ipctool.
+else ifeq ($(OPENIPC_SOC_FAMILY),gk7206v100)
+HISILICON_OPENSDK_KMOD_DST = $(TARGET_DIR)/lib/modules/$(HISILICON_OPENSDK_KVER)/goke
+ifeq ($(OPENIPC_VARIANT),ultimate)
+define HISILICON_OPENSDK_INSTALL_GK7206_EXTRAS
+	$(INSTALL) -D -m 0644 $(@D)/libraries/gk7206v100/xmedia_svp/libxmedia_svp.so \
+		$(TARGET_DIR)/usr/lib/libxmedia_svp.so
+endef
+endif
+define HISILICON_OPENSDK_INSTALL_TARGET_CMDS
+	$(INSTALL) -D -m 0644 $(@D)/libraries/gk7206v100/xmedia_msensor/libxmedia_msensor.so \
+		$(TARGET_DIR)/usr/lib/libxmedia_msensor.so
+	$(HISILICON_OPENSDK_INSTALL_GK7206_EXTRAS)
+	$(INSTALL) -m 755 -d $(TARGET_DIR)/usr/lib/sensors
+	$(foreach s,$(HISILICON_OPENSDK_SENSORS), \
+		$(INSTALL) -D -m 0644 $(@D)/libraries/sensor/gk7206v100/$(s).so $(TARGET_DIR)/usr/lib/sensors ; \
+	)
+	$(INSTALL) -m 755 -d $(HISILICON_OPENSDK_KMOD_DST)
+	for ko in $(@D)/kernel/open_*.ko; do \
+		[ -f $${ko} ] || continue; \
+		$(TARGET_STRIP) --strip-unneeded --remove-section=.comment --remove-section=.note $${ko}; \
+		$(INSTALL) -m 644 -t $(HISILICON_OPENSDK_KMOD_DST) $${ko} || exit 1; \
 	done
 endef
 
@@ -612,6 +712,24 @@ define HISILICON_OPENSDK_INSTALL_TARGET_CMDS
 	$(INSTALL) -m 644 $(@D)/kernel/open_hi_user.ko       $(HISILICON_OPENSDK_KMOD_DST)/hiuser.ko
 	$(INSTALL) -m 644 $(@D)/kernel/open_gpioi2c.ko       $(HISILICON_OPENSDK_KMOD_DST)/gpioi2c.ko
 	$(INSTALL) -m 644 $(@D)/kernel/open_nvp6134_ex.ko    $(HISILICON_OPENSDK_KMOD_DST)/nvp6134_ex.ko
+endef
+
+# hi3536dv100: the NVR's whole module set comes from openhisilicon -- OSAL and
+# wdt from the SDK's source, the MPP modules relinked from the SDK's .ko files
+# (OpenIPC/openhisilicon#266, #268). Installed as open_*.ko, which
+# load_hisilicon reaches with `modprobe open_<m>`, as on cv6xx; only the ones it
+# loads ship. Stripped as on cv6xx: target-finalize leaves *.ko alone.
+else ifeq ($(OPENIPC_SOC_FAMILY),hi3536dv100)
+HISILICON_OPENSDK_KMOD_DST = $(TARGET_DIR)/lib/modules/4.9.37/hisilicon
+HISILICON_OPENSDK_HI3536DV100_KO = osal wdt base sys vdec vfmw jpegd tde region \
+	vgs vpss vou hifb hdmi venc chnl jpege aio ai ao aenc adec acodec
+define HISILICON_OPENSDK_INSTALL_TARGET_CMDS
+	$(INSTALL) -m 755 -d $(HISILICON_OPENSDK_KMOD_DST)
+	for m in $(HISILICON_OPENSDK_HI3536DV100_KO); do \
+		$(TARGET_STRIP) --strip-unneeded --remove-section=.comment --remove-section=.note \
+			-o $(HISILICON_OPENSDK_KMOD_DST)/open_$$m.ko $(@D)/kernel/open_$$m.ko || exit 1; \
+		chmod 644 $(HISILICON_OPENSDK_KMOD_DST)/open_$$m.ko; \
+	done
 endef
 
 else
@@ -686,7 +804,7 @@ define HISILICON_OPENSDK_PRUNE_CV6XX_LITE
 endef
 endif
 
-ifneq ($(filter hi3516cv500 hi3516cv200 hi3516cv100 hi3516av100 hi3519v101 hi3516cv300 hi3520dv200 hi3516cv6xx hi3519dv500,$(OPENIPC_SOC_FAMILY)),)
+ifneq ($(filter hi3516cv500 hi3516cv200 hi3516cv100 hi3516av100 hi3519v101 hi3516cv300 hi3520dv200 hi3536dv100 hi3516cv6xx hi3519dv500,$(OPENIPC_SOC_FAMILY)),)
 define HISILICON_OPENSDK_FINALIZE_MODULES
 	$(if $(BR2_PER_PACKAGE_DIRECTORIES),rsync -a $(PER_PACKAGE_DIR)/hisilicon-opensdk/target/lib/modules/ $(TARGET_DIR)/lib/modules/)
 	rm -rf $(TARGET_DIR)/lib/modules/*/extra/open_*.ko
@@ -718,9 +836,10 @@ endef
 HISILICON_OPENSDK_TARGET_FINALIZE_HOOKS += HISILICON_OPENSDK_FINALIZE_MODULES_GK7205V200
 endif
 
-# For gk7205v500: every module is renamed into goke/, so none of the
-# source-named copies in extra/ is reachable; drop them all.
-ifeq ($(OPENIPC_SOC_FAMILY),gk7205v500)
+# For gk7205v500 and gk7206v100: every module is installed again into goke/
+# (renamed, or stripped), so the copies the kernel-module install left in
+# extra/ are duplicates; drop them all.
+ifneq ($(filter $(OPENIPC_SOC_FAMILY),gk7205v500 gk7206v100),)
 define HISILICON_OPENSDK_FINALIZE_MODULES_GK7205V500
 	$(if $(BR2_PER_PACKAGE_DIRECTORIES),rsync -a $(PER_PACKAGE_DIR)/hisilicon-opensdk/target/lib/modules/ $(TARGET_DIR)/lib/modules/)
 	rm -f $(TARGET_DIR)/lib/modules/*/extra/open_*.ko

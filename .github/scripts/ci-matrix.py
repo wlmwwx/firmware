@@ -87,6 +87,10 @@ ALL_BOARDS = [
     # gk7205v510 is firmware-identical to gk7205v500 --- built once and served
     # via gk7205v500's BR2_OPENIPC_SOC_ALIASES (manifest @alias).
     "gk7201v200_lite", "gk7205v500_lite",
+    # Goke [GK7206V100]
+    # gk7206v10/v10b/v11/v11a/v11at are firmware-identical to gk7206v12a ---
+    # served via gk7206v100's BR2_OPENIPC_SOC_ALIASES (manifest @alias).
+    "gk7206v100_lite",
     # Allwinner
     "v851s_lite",
     # Fullhan
@@ -189,11 +193,13 @@ NO_BUILD_WORKFLOWS = {
 # matrices between them in six weeks, proving nothing about an image.
 NO_BUILD_SCRIPTS = {
     "build-summary.py", "enrich_manifest.py", "lint-issue-forms.py",
-    "test_ca_bundle_lite.sh",
+    "test_ca_bundle_lite.sh", "test_network_failover.sh",
     "lint-workflow-shell.py", "push_build.py", "soc_aliases.py",
     "test_automount.sh", "test_check_mac.sh", "test_excludes_report.sh",
-    "test_load_hisilicon.sh", "test_push_build.py", "test_shell_parse.sh",
+    "test_load_hisilicon.sh", "test_load_goke.sh", "test_load_hisilicon_layout.sh", "test_push_build.py", "test_shell_parse.sh",
     "test_strip_shell_comments.sh", "test_sysupgrade.sh", "test_crashlog.sh", "test_majestic_supervise.sh",
+    "test_vigil_supervise.sh",
+    "test_init_overlay.sh",
     # build-one.yml's request parser and its test: dispatch and shell-tests
     # only, never part of a board build.
     "build_request.sh", "test_build_request.sh",
@@ -299,7 +305,7 @@ NOT_BUILT = {
     "adaptive-link", "aic8800-openipc", "allwinner-osdrv-v83x", "atbm-wifi",
     "aura-httpd", "baresip-openipc", "comgt", "f2fs-tools-openipc", "faceter-agent",
     "faceter-detector", "fdk-aac-openipc", "ffmpeg-openipc", "gdbserver-lite",
-    "go2rtc", "herald", "hisi-gpio", "hisilicon-osdrv-hi3536dv100", "i2c-telemetry",
+    "go2rtc", "herald", "hisi-gpio", "i2c-telemetry",
     "jsonfilter", "libhv-openipc", "libre-openipc", "libsrt-openipc",
     "matter",
     "mavfwd", "mdnsd-openipc", "mini", "mqtt-bot", "msposd", "n3n-openipc", "nabto",
@@ -350,6 +356,13 @@ BOARD_DIR = re.compile(r"^(br-ext-chip-[^/]+)/board/([^/]+)/")
 # that nested package, not "legacy". A file directly in legacy/ still matches
 # as "legacy" and widens.
 PACKAGE_DIR = re.compile(r"^general/package/(?:legacy/)?([^/]+)/")
+# The package index: general/package/Config.in, which sources every package's
+# Config.in. Adding or removing a package touches it, and nothing else in it
+# changes what a board builds, so a diff that only adds or drops source lines
+# narrows to the boards enabling those packages (see package_index_change).
+PACKAGE_INDEX = "general/package/Config.in"
+INDEX_SOURCE = re.compile(
+    r'^source "\$BR2_EXTERNAL_GENERAL_PATH/package/(?:legacy/)?([^/"]+)/Config\.in"$')
 PACKAGE_GLOBS = ("general/package/*/", "general/package/legacy/*/")
 
 # Label that forces the full matrix on a PR, for when you do not trust the
@@ -531,11 +544,15 @@ class Tree:
 # --------------------------------------------------------------------------
 
 def classify(tree, changed, labels=(), event="pull_request", draft=False,
-             base_boards=None):
+             base_boards=None, index_packages=None):
     """Map a list of changed paths to {rows, needs_build, reason}.
 
     base_boards is ALL_BOARDS as the PR's base revision had it, or None when it
     could not be read; only an edit to this file consults it.
+
+    index_packages is the set of packages whose source lines are the whole of
+    the PR's change to PACKAGE_INDEX, or None when the change is anything more
+    (or its diff could not be read); only an edit to PACKAGE_INDEX consults it.
     """
     full = list(tree.built)
 
@@ -600,6 +617,20 @@ def classify(tree, changed, labels=(), event="pull_request", draft=False,
                 continue
             return _decision(full, True, reason=f"{path} is an unknown SoC family")
 
+        if path == PACKAGE_INDEX and index_packages is not None:
+            # Only source lines came or went. kconfig parses the index the same
+            # way for every board, so the smoke set proves the parse; the boards
+            # enabling a package that came or went prove the build. A package
+            # boards enable by default reaches every board.
+            if any(package in tree.implicit for package in index_packages):
+                return _decision(full, True,
+                                 reason=f"{path} sources a package boards enable by default")
+            for package in index_packages:
+                boards.update(tree.boards_for_package(package))
+            boards.update(tree.smoke)
+            smoked = smoked or f"{path} source lines"
+            continue
+
         package_dir = PACKAGE_DIR.match(path)
         if package_dir:
             if package_dir.group(1) in tree.implicit:
@@ -656,6 +687,27 @@ def _decision(rows, needs_build, reason):
     }
 
 
+def package_index_change(patch):
+    """The packages a diff of PACKAGE_INDEX adds or drops, or None.
+
+    None unless every added and removed line is a package source line: any
+    other edit to the index (a menu, an if, a comment) widens as before.
+    """
+    if not patch:
+        return None
+    packages = set()
+    for line in patch.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if not line.startswith(("+", "-")):
+            continue
+        source = INDEX_SOURCE.match(line[1:].strip())
+        if not source:
+            return None
+        packages.add(source.group(1))
+    return packages or None
+
+
 # --------------------------------------------------------------------------
 # GitHub plumbing
 # --------------------------------------------------------------------------
@@ -664,16 +716,17 @@ def changed_files_from_api():
     """Ask the API which files the PR touches.
 
     Cheaper and more robust than a diff: computing a merge base needs history
-    the build jobs otherwise only ever clone shallowly.
+    the build jobs otherwise only ever clone shallowly. Returns the paths and
+    the patch of PACKAGE_INDEX (None if untouched or not given), or None, None.
     """
     repo = os.environ.get("GITHUB_REPOSITORY")
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     event = _event()
     number = event.get("pull_request", {}).get("number")
     if not (repo and token and number):
-        return None
+        return None, None
 
-    files, page = [], 1
+    files, index_patch, page = [], None, 1
     while True:
         url = (f"https://api.github.com/repos/{repo}/pulls/{number}/files"
                f"?per_page=100&page={page}")
@@ -684,12 +737,16 @@ def changed_files_from_api():
         with urllib.request.urlopen(request, timeout=30) as response:
             batch = json.load(response)
         files += [entry["filename"] for entry in batch]
+        # The API omits "patch" for a diff it considers too large; then
+        # index_patch stays None and an edit to the index widens.
+        index_patch = next((entry.get("patch") for entry in batch
+                            if entry["filename"] == PACKAGE_INDEX), index_patch)
         # A rename drops the old path from the list; it may be the only thing
         # tying the change to a SoC, so count it too.
         files += [entry["previous_filename"] for entry in batch
                   if entry.get("previous_filename")]
         if len(batch) < 100:
-            return files
+            return files, index_patch
         page += 1
         # The endpoint stops at 3000 files. Returning what we have would be a
         # partial list, and a partial list can only ever narrow the matrix too
@@ -697,7 +754,7 @@ def changed_files_from_api():
         # everything".
         if page > 30:
             print("ci-matrix: PR exceeds the 3000-file listing limit", file=sys.stderr)
-            return None
+            return None, None
 
 
 def all_boards_of(source):
@@ -878,19 +935,20 @@ def self_test():
         (["general/package/hisilicon-osdrv-hi3516ev200/files/script/load_hisilicon"],
          8, "osdrv narrows to its family"),
         (["general/package/hisilicon-opensdk/hisilicon-opensdk.mk"],
-         47, "opensdk spans HiSilicon and Goke"),
+         49, "opensdk spans HiSilicon and Goke"),
         (["general/package/goke-osdrv-gk7205v200/Config.in"], 7, "goke osdrv"),
         (["general/package/hisilicon-osdrv-hi3520dv200/files/script/load_hisilicon"],
          1, "single-board osdrv"),
         # The two edge kinds the closure depends on. uclibc-compat is reached
-        # only through a .mk _DEPENDENCIES line and sigmastar-osdrv-sensors only
-        # through a Config.in select; either one missing zeroes them out.
+        # through a .mk _DEPENDENCIES line from the three hi3516cv100 boards
+        # (gk7206v100 selects it too, the fourth), and sigmastar-osdrv-sensors
+        # only through a Config.in select; either kind missing drops the count.
         (["general/package/uclibc-compat/src/uclibc-compat-static.c"],
-         3, "reached via .mk _DEPENDENCIES"),
+         4, "reached via .mk _DEPENDENCIES"),
         (["general/package/sigmastar-osdrv-sensors/Config.in"],
          24, "reached via Config.in select"),
         # Shared packages narrow too, just barely.
-        (["general/package/majestic/majestic.mk"], 89, "majestic is nearly everywhere"),
+        (["general/package/majestic/majestic.mk"], 90, "majestic is nearly everywhere"),
         # Board configs and kernel configs.
         (["br-ext-chip-goke/configs/gk7205v200_lite_defconfig"], 1, "one defconfig"),
         (["br-ext-chip-hisilicon/board/hi3516ev200/hi3516ev300.generic.config"],
@@ -964,6 +1022,8 @@ def self_test():
         ([".github/scripts/test_automount.sh"], 0, "shell-tests: automount"),
         ([".github/scripts/test_excludes_report.sh"], 0, "shell-tests: excludes"),
         ([".github/scripts/test_ca_bundle_lite.sh"], 0, "shell-tests: lite CA bundle"),
+        ([".github/scripts/test_network_failover.sh"], 0, "shell-tests: network failover"),
+        ([".github/scripts/test_init_overlay.sh"], 0, "shell-tests: init overlay"),
         ([".github/workflows/toolchain-asan.yml"], 0, "ASan toolchain is dispatch-only"),
         ([".github/workflows/vendor-abi.yml"], 0, "the advisory ABI audit"),
         ([".github/workflows/lint.yml"], 0, "the workflow linter never builds"),
@@ -980,7 +1040,7 @@ def self_test():
         (["LICENSES/vendor.txt"], full, "LICENSES/ is not the licence file"),
         (["READMEgenerator.c"], full, "README prefix is not a readme"),
         (["general/package/majestic/README.md"],
-         89, "markdown inside a package is that package"),
+         90, "markdown inside a package is that package"),
         (["br-ext-chip-hisilicon/board/hi3516ev200/NOTES.md"],
          8, "markdown inside a board dir is that family"),
         (["general/scripts/pr_compliance_checklist.yaml"],
@@ -1009,6 +1069,38 @@ def self_test():
     if len(classify(tree, selector + ["general/overlay/etc/passwd"],
                     base_boards=set(tree.built))["rows"]) != full:
         problems.append("selector edit plus an overlay file must still widen")
+    # 5c. A change to the package index made only of source lines builds the
+    #     boards enabling those packages plus the smoke set; anything else in
+    #     it, or a diff we could not read, widens.
+    index = [PACKAGE_INDEX]
+    line = 'source "$BR2_EXTERNAL_GENERAL_PATH/package/{}/Config.in"'
+    package = next(p for p in sorted(tree.symbols_of)
+                   if p not in tree.implicit and tree.boards_for_package(p)
+                   and set(tree.boards_for_package(p)) - set(tree.smoke))
+    expected = set(tree.smoke) | set(tree.boards_for_package(package))
+    got = set(classify(tree, index, index_packages={package})["rows"])
+    if got != expected:
+        problems.append(f"index source line for {package}: expected "
+                        f"{sorted(expected)}, got {sorted(got)}")
+    if len(classify(tree, index)["rows"]) != full:
+        problems.append("an index edit with no readable diff must widen")
+    if tree.implicit and len(classify(
+            tree, index, index_packages={sorted(tree.implicit)[0]})["rows"]) != full:
+        problems.append("an index source line for a default-on package must widen")
+    if len(classify(tree, index + ["general/overlay/etc/passwd"],
+                    index_packages={package})["rows"]) != full:
+        problems.append("an index source line plus an overlay file must still widen")
+    for patch, want, what in [
+            (f"@@ -1,2 +1,3 @@\n {line.format('a')}\n+{line.format(package)}\n",
+             {package}, "an added source line"),
+            (f"@@ -1,3 +1,2 @@\n-{line.format(package)}\n {line.format('a')}\n",
+             {package}, "a removed source line"),
+            (f"@@ -1,2 +1,3 @@\n+menu \"x\"\n+{line.format(package)}\n",
+             None, "a source line with a menu"),
+            ("", None, "an empty diff")]:
+        if package_index_change(patch) != want:
+            problems.append(f"package_index_change on {what}: expected {want}")
+
     source = open(os.path.abspath(__file__)).read()
     if all_boards_of(source) != set(ALL_BOARDS):
         problems.append("all_boards_of() cannot read ALL_BOARDS back out of this file")
@@ -1074,6 +1166,10 @@ def main():
     parser.add_argument("--base-file", metavar="PATH",
                         help="with --stdin: the base revision's ci-matrix.py, so an "
                              "edit to it narrows as it would on a pull request")
+    parser.add_argument("--index-diff", metavar="PATH",
+                        help="with --stdin: a diff of general/package/Config.in, "
+                             "so a change of only source lines narrows as it "
+                             "would on a pull request")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -1084,19 +1180,22 @@ def main():
     if args.stdin:
         changed = [line.strip() for line in sys.stdin if line.strip()]
         event, labels, draft = "pull_request", [], False
-        base_boards = None
+        base_boards, index_patch = None, None
         if args.base_file:
             with open(args.base_file) as handle:
                 base_boards = all_boards_of(handle.read())
+        if args.index_diff:
+            with open(args.index_diff) as handle:
+                index_patch = handle.read()
     else:
         event = os.environ.get("GITHUB_EVENT_NAME", "pull_request")
         pull_request = _event().get("pull_request", {})
         labels = [label["name"] for label in pull_request.get("labels", [])]
         draft = bool(pull_request.get("draft"))
-        changed, base_boards = None, None
+        changed, base_boards, index_patch = None, None, None
         if event == "pull_request":
             try:
-                changed = changed_files_from_api()
+                changed, index_patch = changed_files_from_api()
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 # Never fail the run over this; an empty list means full matrix.
                 print(f"ci-matrix: cannot list PR files ({exc})", file=sys.stderr)
@@ -1108,7 +1207,8 @@ def main():
                     print(f"ci-matrix: cannot read the base {SELECTOR} ({exc})",
                           file=sys.stderr)
 
-    decision = classify(tree, changed or [], labels, event, draft, base_boards)
+    decision = classify(tree, changed or [], labels, event, draft, base_boards,
+                        package_index_change(index_patch))
 
     print(f"ci-matrix: {len(decision['rows'])}/{len(tree.built)} boards "
           f"(needs_build={decision['needs_build']}) --- {decision['reason']}",

@@ -178,6 +178,27 @@ endif
 	@$(call PREPARE_REPACK,firmware.bin,$(shell expr $(subst ",,$(BR2_OPENIPC_FLASH_SIZE)) \* 1024),,,nor)
 else ifeq ($(BR2_OPENIPC_SOC_FAMILY),"hi3519dv500")
 	@$(call PREPARE_REPACK,firmware.bin,$(shell expr $(subst ",,$(BR2_OPENIPC_FLASH_SIZE)) \* 1024),,,nor)
+else ifneq ($(and $(filter "gk7205v200",$(BR2_OPENIPC_SOC_FAMILY)),$(wildcard $(TARGET)/images/firmware.bin)),)
+# gk7205v200-family NOR ships twice. The plain package is the fixed-slot one,
+# uImage and rootfs: cameras whose sysupgrade predates the split layout upgrade
+# from it. The -split package is firmware.bin (board/gk7205v200/post-image.sh),
+# the same uImage and the squashfs back to back in one "firmware" partition the
+# kernel splits at boot, whatever bootloader loaded it; only its whole is
+# bounded: the chip, less boot and env (320K) and the smallest overlay worth
+# keeping (256K).
+#
+# The uImage stays a 64 KiB block short of its 2 MiB slot: under 1984K, which
+# CHECK_SIZE, counting whole KB, enforces as 1983K. The kernel,
+# U-Boot and sysupgrade tell the layouts apart by where the squashfs is: at the
+# block right after the uImage is the split layout, at the slot boundary fixed
+# slots. A fixed-slot uImage ending in the slot's last block would be both.
+ifeq ($(BR2_OPENIPC_FLASH_SIZE),"8")
+	@$(call PREPARE_REPACK,uImage,1983,rootfs.squashfs,5120,nor)
+else
+	@$(call PREPARE_REPACK,uImage,1983,rootfs.squashfs,8192,nor)
+endif
+	@$(call CHECK_SIZE,firmware.bin,$(shell expr $(subst ",,$(BR2_OPENIPC_FLASH_SIZE)) \* 1024 - 576))
+	@$(call REPACK_NOR_SPLIT)
 else ifneq ($(wildcard $(TARGET)/images/firmware.bin),)
 	@$(call PREPARE_REPACK,firmware.bin,8192,,,nor)
 else
@@ -203,7 +224,17 @@ else ifneq ($(wildcard $(PWD)/br-ext-chip-$(subst ",,$(BR2_OPENIPC_SOC_VENDOR))/
 # so it is held to the 24M the installer stages (openipc.org's 0x1800000),
 # which still clears the relocated U-Boot at the top of a 64M part
 # (hi3516ev200).
+#
+# gk7205v500 is held to 32M instead: its ultimate build carries the NPU's
+# object detectors (xmnpu-models, 22 MB, NAND only), which take rootfs.ubi to
+# about 29.5M. Its parts have 128M of DDR, so the image still clears U-Boot,
+# but a fresh install has to stage at least 0x1E00000 for it -- the 0x1800000
+# above would truncate it. sysupgrade writes rootfs.ubifs and is unaffected.
+ifeq ($(BR2_OPENIPC_SOC_FAMILY),"gk7205v500")
+	@$(call CHECK_SIZE,rootfs.ubi,32768)
+else
 	@$(call CHECK_SIZE,rootfs.ubi,24576)
+endif
 	@$(call REPACK_NAND_FIT)
 else
 	@$(call PREPARE_REPACK,uImage,4096,rootfs.ubi,16384,nand)
@@ -328,6 +359,17 @@ define REPACK_FIRMWARE
 	# order loses the checksum and leaves a short image that sysupgrade's
 	# `md5sum -c *.md5sum` then cannot see at all.
 	cd $(TARGET)/images && tar -czf $(ARCHIVE) $(KERNEL_MD5) $(ROOTFS_MD5) $(KERNEL) $(ROOTFS)
+	rm -f $(TARGET)/images/*.md5sum
+endef
+
+# The split NOR package: firmware.bin alone, under its own name so a sysupgrade
+# that predates the layout never sees it. Copies, as REPACK_NAND_FIT does.
+define REPACK_NOR_SPLIT
+	cd $(TARGET)/images && cp -f firmware.bin firmware.bin.$(BR2_OPENIPC_SOC_MODEL) && \
+		md5sum firmware.bin.$(BR2_OPENIPC_SOC_MODEL) > firmware.bin.$(BR2_OPENIPC_SOC_MODEL).md5sum
+	# Checksums first, as in REPACK_FIRMWARE.
+	cd $(TARGET)/images && tar -czf openipc.$(BR2_OPENIPC_SOC_MODEL)-nor-$(BR2_OPENIPC_VARIANT)-split.tgz \
+		firmware.bin.$(BR2_OPENIPC_SOC_MODEL).md5sum firmware.bin.$(BR2_OPENIPC_SOC_MODEL)
 	rm -f $(TARGET)/images/*.md5sum
 endef
 

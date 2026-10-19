@@ -23,6 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash .github/scripts/test_load_hisilicon.sh
+      # load_goke runs under busybox sh and awk on the camera, and its zone
+      # arithmetic depends on busybox awk reading hex.
+      - name: Install busybox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox-static
+      - run: bash .github/scripts/test_load_goke.sh
+      - run: bash .github/scripts/test_load_hisilicon_layout.sh
 
   sysupgrade-verify:
     name: sysupgrade rootfs verification
@@ -86,6 +94,41 @@ jobs:
             general/package/majestic/files/S95majestic > /tmp/S95majestic.stripped
           SRC=/tmp/S95majestic.stripped bash .github/scripts/test_majestic_supervise.sh
 
+  vigil-supervise:
+    name: vigil restarted after a crash, its arguments and recording path
+    if: >-
+      github.repository == 'OpenIPC/firmware' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !github.event.repository.private)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/test_vigil_supervise.sh
+      - name: Re-run against the comment-stripped form
+        run: |
+          awk -f general/scripts/strip-shell-comments.awk \
+            general/package/vigil/files/S95vigil > /tmp/S95vigil.stripped
+          SRC=/tmp/S95vigil.stripped bash .github/scripts/test_vigil_supervise.sh
+
+  network-failover:
+    name: cable-primary networking and its carrier watcher
+    if: >-
+      github.repository == 'OpenIPC/firmware' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !github.event.repository.private)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/test_network_failover.sh
+      - name: Re-run against the comment-stripped forms
+        run: |
+          awk -f general/scripts/strip-shell-comments.awk \
+            general/overlay/etc/init.d/S40network > /tmp/S40network.stripped
+          awk -f general/scripts/strip-shell-comments.awk \
+            general/overlay/usr/share/udhcpc/default.script > /tmp/default.script.stripped
+          S40=/tmp/S40network.stripped DS=/tmp/default.script.stripped \
+            bash .github/scripts/test_network_failover.sh
+
   camera-mac:
     name: the MAC the camera gives itself
     if: >-
@@ -106,6 +149,26 @@ jobs:
           awk -f general/scripts/strip-shell-comments.awk \
             general/overlay/usr/sbin/extutils > /tmp/extutils.stripped
           SRC=/tmp/extutils.stripped bash .github/scripts/test_check_mac.sh
+
+  init-overlay:
+    name: init keeps an overlay it cannot mount
+    if: >-
+      github.repository == 'OpenIPC/firmware' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !github.event.repository.private)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/test_init_overlay.sh
+
+      # /init is comment-stripped into every image and decides, on every boot
+      # of every camera, whether rootfs_data is erased. The stripped form is
+      # the one that has to get that right.
+      - name: Re-run against the stripped form that actually ships
+        run: |
+          awk -f general/scripts/strip-shell-comments.awk \
+            general/overlay/init > /tmp/init.stripped
+          SRC=/tmp/init.stripped bash .github/scripts/test_init_overlay.sh
 
   # Only sysupgrade was ever parse-checked; every other script in the image --
   # the init scripts, /etc/profile, /init on initramfs boards, the vendor load_*
@@ -209,11 +272,14 @@ jobs:
       - load-hisilicon-parsing
       - sysupgrade-verify
       - camera-mac
+      - init-overlay
       - crashlog-capture
       - excludes-report
       - ca-bundle-lite
       - shipped-shell-parse
       - build-request
+      - network-failover
+      - vigil-supervise
     # always() so the gate reports when a needed job fails, but not on a run
     # whose jobs the guard above deliberately skipped. Upstream the added
     # disjunct is true, so this reduces to always().
@@ -226,7 +292,7 @@ jobs:
     steps:
       - name: Require every shell test to succeed
         run: |
-          echo "load-hisilicon=${{ needs.load-hisilicon-parsing.result }} sysupgrade=${{ needs.sysupgrade-verify.result }} camera-mac=${{ needs.camera-mac.result }} crashlog=${{ needs.crashlog-capture.result }} excludes=${{ needs.excludes-report.result }} ca-bundle=${{ needs.ca-bundle-lite.result }} shell-parse=${{ needs.shipped-shell-parse.result }} build-request=${{ needs.build-request.result }}"
+          echo "load-hisilicon=${{ needs.load-hisilicon-parsing.result }} sysupgrade=${{ needs.sysupgrade-verify.result }} camera-mac=${{ needs.camera-mac.result }} init-overlay=${{ needs.init-overlay.result }} crashlog=${{ needs.crashlog-capture.result }} excludes=${{ needs.excludes-report.result }} ca-bundle=${{ needs.ca-bundle-lite.result }} shell-parse=${{ needs.shipped-shell-parse.result }} build-request=${{ needs.build-request.result }} network-failover=${{ needs.network-failover.result }} vigil=${{ needs.vigil-supervise.result }}"
           # 'skipped' is not accepted, for the reason given in lint.yml: a
           # skipped job would take this context green having checked nothing.
           if [ "${{ needs.load-hisilicon-parsing.result }}" != "success" ]; then
@@ -238,8 +304,17 @@ jobs:
           if [ "${{ needs.build-request.result }}" != "success" ]; then
             echo "::error::build request parser tests did not succeed"; exit 1
           fi
+          if [ "${{ needs.network-failover.result }}" != "success" ]; then
+            echo "::error::network failover tests did not succeed"; exit 1
+          fi
+          if [ "${{ needs.vigil-supervise.result }}" != "success" ]; then
+            echo "::error::S95vigil supervisor tests did not succeed"; exit 1
+          fi
           if [ "${{ needs.camera-mac.result }}" != "success" ]; then
             echo "::error::the MAC the camera gives itself did not succeed"; exit 1
+          fi
+          if [ "${{ needs.init-overlay.result }}" != "success" ]; then
+            echo "::error::init keeping an overlay it cannot mount did not succeed"; exit 1
           fi
           if [ "${{ needs.crashlog-capture.result }}" != "success" ]; then
             echo "::error::crash log capture did not succeed"; exit 1

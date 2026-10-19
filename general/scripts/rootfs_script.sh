@@ -9,7 +9,8 @@ date +GITHUB_VERSION="\"${GIT_BRANCH-local}+${GIT_HASH-build}, %Y-%m-%d"\" >> ${
 echo BUILD_OPTION=${OPENIPC_VARIANT} >> ${FILE}
 echo BUILD_ID=${BUILD_ID:-local-$(date -u +%Y%m%d)-${GIT_HASH-build}} >> ${FILE}
 echo BUILD_SHA=${BUILD_SHA:-${GIT_HASH-build}} >> ${FILE}
-echo BUILD_PLATFORM=${BUILD_PLATFORM:-${OPENIPC_SOC_MODEL}_${OPENIPC_VARIANT}} >> ${FILE}
+PLATFORM=${BUILD_PLATFORM:-${OPENIPC_SOC_MODEL}_${OPENIPC_VARIANT}}
+echo BUILD_PLATFORM=${PLATFORM} >> ${FILE}
 date +TIME_STAMP=%s >> ${FILE}
 
 # The image ships no majestic.yaml: majestic runs on its own defaults until a
@@ -48,6 +49,25 @@ fi
 # to bring its lite board back under the cap. Kept wherever kmod is installed.
 if [ -z "$(find ${TARGET_DIR}/bin ${TARGET_DIR}/sbin ${TARGET_DIR}/usr/bin ${TARGET_DIR}/usr/sbin -name kmod -type f 2>/dev/null)" ]; then
 	rm -f ${TARGET_DIR}/lib/modules/*/modules.*.bin ${TARGET_DIR}/lib/modules/*/modules.builtin.modinfo
+
+	# busybox opens modules.symbols only for a "symbol:X" request, which only
+	# symbol_request(X) makes, and that macro leaves the literal in its caller.
+	# With none in the kernel or in a shipped module the file is dead weight:
+	# 12KB on hi3516cv6xx, 1.5KB of squashfs, part of what brought its lite
+	# board back under the cap. Kept if the kernel cannot be found to check.
+	vmlinux=$(ls ${BUILD_DIR:-/nonexistent}/linux-*/vmlinux 2>/dev/null | head -n1)
+	if [ -n "${vmlinux}" ] && ! grep -qaF 'symbol:' "${vmlinux}" &&
+		! grep -rqaF 'symbol:' --exclude='modules.*' ${TARGET_DIR}/lib/modules 2>/dev/null; then
+		rm -f ${TARGET_DIR}/lib/modules/*/modules.symbols
+	fi
+fi
+
+# The overlay's WireGuard client drives wg, which only wireguard-tools installs.
+# Without it /usr/sbin/wireguard can never bring wg0 up, so it goes with its
+# init script and interface stanza: 0.7KB of squashfs on hi3516cv6xx lite.
+if ! grep -q '^BR2_PACKAGE_WIREGUARD_TOOLS=y' ${BR2_CONFIG}; then
+	rm -f ${TARGET_DIR}/usr/sbin/wireguard ${TARGET_DIR}/etc/init.d/S98wireguard \
+		${TARGET_DIR}/etc/network/interfaces.d/wg0
 fi
 
 LIST="${BR2_EXTERNAL_GENERAL_PATH}/scripts/excludes/${OPENIPC_SOC_MODEL}_${OPENIPC_VARIANT}.list"
@@ -129,10 +149,12 @@ if [ -f "${NAND_FIT_ITS}" ] && grep -q "^BR2_TARGET_ROOTFS_UBI=y" "${BR2_CONFIG}
 	FIT_DIR="${BINARIES_DIR}/nand-fit"
 	rm -rf "${FIT_DIR}" && mkdir -p "${FIT_DIR}" || exit 1
 	# @SOC@ is the SoC the FIT is stamped with (sysupgrade's fit_soc reads it);
+	# @PLATFORM@ the BUILD_PLATFORM above (fit_platform reads that one);
 	# @DTB@ is for a family .its whose models each build their own
 	# <model>-demb.dtb (hi3516ev200 family). An .its naming its DTB outright
 	# has no @DTB@ and is copied as it is.
-	sed -e "s/@SOC@/${OPENIPC_SOC_MODEL}/" -e "s/@DTB@/${OPENIPC_SOC_MODEL}-demb.dtb/g" \
+	sed -e "s/@SOC@/${OPENIPC_SOC_MODEL}/" -e "s/@PLATFORM@/${PLATFORM}/" \
+		-e "s/@DTB@/${OPENIPC_SOC_MODEL}-demb.dtb/g" \
 		"${NAND_FIT_ITS}" > "${FIT_DIR}/nand-fit.its" || exit 1
 	cp "${KBOOT}/zImage" "${FIT_DIR}/" || { echo "NAND FIT: no zImage in ${KBOOT}" >&2; exit 1; }
 	# Every DTB the stamped .its names, from the kernel's dts output.

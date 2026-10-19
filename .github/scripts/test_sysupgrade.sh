@@ -66,6 +66,7 @@ sed -e 's|"$1/etc/os-release"|"${1:-@SB@}@OSRELEASE@"|g' \
     -e "s|/proc/meminfo|@SB@/proc/meminfo|g" \
     -e "s|/proc/sys/vm/drop_caches|@SB@/tmp/drop_caches|g" \
     -e "s|/etc/init.d/|@SB@/etc/init.d/|g" \
+    -e "s|/var/run/vigil-supervise.pid|@SB@/tmp/vigil-supervise.pid|g" \
     -e "s|/bin/busybox|@SB@/bin/busybox|g" \
     -e "s|@OSRELEASE@|/etc/os-release|g" \
     -e "s|@SB@|$SB|g" \
@@ -79,8 +80,27 @@ for s in S99rc.local S60crond S49ntpd S02klogd S01syslogd; do
 done
 # This one logs: whether majestic is put back is a behaviour worth asserting,
 # not just a service that had to exist for the script not to trip over it.
-printf '#!/bin/sh\necho "S95majestic $1" >> "$FLASH_LOG"\nexit 0\n' \
-    > "$SB/etc/init.d/S95majestic"; chmod +x "$SB/etc/init.d/S95majestic"
+# A stop can be given back as memory: STUB_MEM_AFTER_STOP is the MemAvailable
+# it leaves, for the tests of stop_majestic_for_memory.
+cat > "$SB/etc/init.d/S95majestic" <<'STUB'
+#!/bin/sh
+# The supervisor will not start majestic while an upgrade holds the lock, so a
+# start or restart made under it is logged as such.
+if [ "$1" != stop ] && [ -f "$STUB_LOCK" ]; then
+    echo "S95majestic $1 (under the upgrade lock)" >> "$FLASH_LOG"
+else
+    echo "S95majestic $1" >> "$FLASH_LOG"
+fi
+[ "$1" = stop ] && [ -n "$STUB_STOP_FAILS" ] && exit 1
+if [ "$1" = stop ] && [ "$STUB_MEM_AFTER_STOP" = unreadable ]; then
+    : > "$STUB_MEMINFO"
+elif [ "$1" = stop ] && [ -n "$STUB_MEM_AFTER_STOP" ]; then
+    printf 'MemTotal: 131072 kB\nMemFree: %d kB\nMemAvailable: %d kB\n' \
+        "$STUB_MEM_AFTER_STOP" "$STUB_MEM_AFTER_STOP" > "$STUB_MEMINFO"
+fi
+exit 0
+STUB
+chmod +x "$SB/etc/init.d/S95majestic"
 
 # ramfs_unwind verifies the restore by reading /proc/mounts before it lets the
 # in-place fallback run, and enter_ramfs consults it to decide whether a leftover
@@ -143,6 +163,11 @@ set_cmdline "$CMDLINE_FLASH"
 stub() { printf '#!/bin/bash\n%s\n' "$2" > "$SB/bin/$1"; chmod +x "$SB/bin/$1"; }
 
 stub ipcinfo    'case "$1" in -v) echo "${STUB_VENDOR:-sigmastar}";; -F) echo "${STUB_FLASH:-nor}";; esac'
+# majestic is running when a test says so, and only then: the host's own
+# pidof would otherwise decide.
+stub pidof '[ "$1" = majestic ] && [ -n "$STUB_MAJESTIC_PID" ] && { echo "$STUB_MAJESTIC_PID"; exit 0; }; [ "$1" = vigild ] && [ -n "$STUB_VIGILD_PID" ] && { echo "$STUB_VIGILD_PID"; exit 0; }; exit 1'
+# Into the flash log, not the host's syslog.
+stub logger 'echo "logger $*" >> "$FLASH_LOG"'
 # `upgrade` is the URL a builder profile writes on first boot; unset models
 # the env that lost it, or never had it (#2484).
 stub fw_printenv '
@@ -216,6 +241,8 @@ if [ "$head" = "1" ]; then
     exit 0
 fi
 [ "$out" = "-" ] && [ -n "${STUB_DL_FILE:-}" ] && cat "$STUB_DL_FILE"
+# fetch_manifest: the channel/build index, when a test supplies one.
+case "$out" in *manifest.flat) [ -n "${STUB_MANIFEST:-}" ] && cp "$STUB_MANIFEST" "$out" ;; esac
 exit "${STUB_CURL_RC:-0}"'
 # check_sdcard re-reads `mount` after every umount, so a static pair of stubs
 # would spin forever: the unmount has to actually change what mount reports.
@@ -227,6 +254,9 @@ cat > "$SB/bin/umount" <<EOF
 #!/bin/bash
 # STUB_UMOUNT_BUSY: a card something still has open -- EBUSY, mount unchanged.
 [ -n "\${STUB_UMOUNT_BUSY:-}" ] && exit 1
+# STUB_UMOUNT_HIDES: the card's files go with it, as they do on a camera -- the
+# directory left behind is an empty mount point.
+[ -n "\${STUB_UMOUNT_HIDES:-}" ] && [ -d "\$1" ] && mv "\$1" "\$1.unmounted"
 if [ -n "\$1" ]; then
     grep -v " \$1 " "\$SDMOUNTS" > "\$SDMOUNTS.n" 2>/dev/null
     mv "\$SDMOUNTS.n" "\$SDMOUNTS" 2>/dev/null
@@ -238,6 +268,9 @@ chmod +x "$SB/bin/umount"
 # host cannot really pivot, and the fallback is the safety property that matters
 # most here (a camera that cannot build a ramfs must still upgrade).
 stub pivot_root 'echo "pivot_root $*" >> "$FLASH_LOG"; exit ${STUB_PIVOT_RC:-1}'
+# enter_ramfs proves the staged root can run before it moves anything; an
+# unprivileged host cannot chroot, so that probe answers STUB_CHROOT_RC (#2605).
+stub chroot     'echo "chroot $*" >> "$FLASH_LOG"; exit ${STUB_CHROOT_RC:-0}'
 stub losetup    'case "$1" in -f) echo /dev/loop0;; -d) echo "losetup -d $2" >> "$FLASH_LOG";; esac; exit 0'
 
 # download_firmware runs `md5sum -s -c`. -s (silent) is a busybox extension; GNU
@@ -281,8 +314,17 @@ case "$applet" in
     reboot)                 echo "reboot" >> "$FLASH_LOG"; exit 0 ;;
     # UBI volume writes, the PID 1 hand-off and the stage-2 unmount: logged
     # like flashcp, so a test can assert what reached which volume, in order.
+    # STUB_UBI_SLOW reads the image on fd 0 a slice at a time, the way the
+    # real one moves it there and reads it a LEB at a time, so the progress
+    # ubi_update reads off /proc/<pid>/fdinfo/0 has something to see.
     ubiupdatevol)           echo "ubiupdatevol $*" >> "$FLASH_LOG"
+                            if [ -n "$STUB_UBI_SLOW" ] && [ -f "$2" ]; then
+                                exec 0< "$2"
+                                while [ "$(dd bs=1024 count=1 2>/dev/null | wc -c)" -gt 0 ]; do sleep 0.4; done
+                            fi
                             [ "1" = "$STUB_FLASHCP_FAIL" ] && exit 1 ;;
+    # follow_start: the console tail and the log server, logged, not run.
+    tail|nc)                echo "$applet $*" >> "$FLASH_LOG" ;;
     kill|ubirmvol|ubirsvol|ubimkvol)
                             echo "$applet $*" >> "$FLASH_LOG" ;;
     umount)                 echo "$applet $*" >> "$FLASH_LOG"
@@ -477,6 +519,7 @@ run() {
         abort_wait=0 RAM_ROOT="$SB/ram" \
         WDOG="${WDOG:-$SB/dev/watchdog}" WDOG_PROC="${WDOG_PROC:-$SB/proc}" \
         STUB_PIVOT_RC="${STUB_PIVOT_RC:-1}" \
+        STUB_CHROOT_RC="${STUB_CHROOT_RC:-0}" \
         STUB_MOUNT="${STUB_MOUNT:-ok}" STUB_VENDOR="${STUB_VENDOR:-sigmastar}" \
         STUB_SOC="${STUB_SOC:-ssc338q}" \
         STUB_IMG_SOC="${STUB_IMG_SOC:-ssc338q}" \
@@ -490,11 +533,19 @@ run() {
         STUB_CURL_RC="${STUB_CURL_RC:-0}" \
         STUB_PREPARE="${STUB_PREPARE:-}" STUB_ABORT="${STUB_ABORT:-}" \
         STUB_UMOUNT_BUSY="${STUB_UMOUNT_BUSY:-}" \
+        STUB_UMOUNT_HIDES="${STUB_UMOUNT_HIDES:-}" \
         STUB_DL_BYTES="${STUB_DL_BYTES:-}" \
         STUB_ISIZE="${STUB_ISIZE:-}" \
         STUB_RANGE_IGNORED="${STUB_RANGE_IGNORED:-}" \
         UNPACK_RESERVE_KB="${UNPACK_RESERVE_KB:-512}" \
+        STUB_MEM_AFTER_STOP="${STUB_MEM_AFTER_STOP:-}" STUB_MEMINFO="$SB/proc/meminfo" \
+        STUB_LOCK="$SB/tmp/sysupgrade.lock" \
+        STUB_STOP_FAILS="${STUB_STOP_FAILS:-}" \
+        STUB_MAJESTIC_PID="${STUB_MAJESTIC_PID:-}" \
+        STUB_VIGILD_PID="${STUB_VIGILD_PID:-}" STUB_VIGIL_STOP_FAILS="${STUB_VIGIL_STOP_FAILS:-}" \
+        FLASH_RAM_FLOOR_KB="${FLASH_RAM_FLOOR_KB:-2048}" \
         UBI_SYS="$SB/sys/class/ubi" INITTAB="$SB/etc/inittab" handoff_wait=0 \
+        FOLLOW_LOG="${FOLLOW_LOG:-}" STUB_UBI_SLOW="${STUB_UBI_SLOW:-}" \
         ${RUN_ENV:-} \
         sh "$SB/sysupgrade" "$@" 2>&1)
     RC=$?
@@ -518,8 +569,10 @@ reset_env() {
     unset STUB_UPGRADE STUB_IMG_PLATFORM STUB_DL_FILE
     set_platform ssc338q_lite
     unset STUB_FLASHCP_FAIL STUB_FLASHCP_FAIL_DEV STUB_PIVOT_RC STUB_REMOUNT_RC STUB_CURL_RC
-    unset STUB_DL_BYTES STUB_ISIZE STUB_RANGE_IGNORED UNPACK_RESERVE_KB
-    unset STUB_PREPARE STUB_ABORT STUB_UMOUNT_BUSY RUN_ENV
+    unset STUB_DL_BYTES STUB_ISIZE STUB_RANGE_IGNORED UNPACK_RESERVE_KB FLASH_RAM_FLOOR_KB
+    unset STUB_MEM_AFTER_STOP STUB_MAJESTIC_PID STUB_STOP_FAILS WDOG WDOG_PROC
+    unset STUB_VIGILD_PID STUB_VIGIL_STOP_FAILS
+    unset STUB_PREPARE STUB_ABORT STUB_UMOUNT_BUSY STUB_UMOUNT_HIDES RUN_ENV FOLLOW_LOG STUB_UBI_SLOW
     rm -rf "$SB/sys"
     printf '::sysinit:/etc/init.d/rcS\n::shutdown:/bin/umount -a -f\n::restart:/sbin/init\n' > "$SB/etc/inittab"
     rm -f "$SB"/tmp/*.gk7205v500
@@ -755,6 +808,28 @@ else
     bad "a /tmp/.. alias must not delete an outside archive, rc=$RC present=$([ -f "$SB/keep/fw.tgz" ] && echo yes || echo no)"
 fi
 
+# ...and an archive on the SD card is unpacked before check_sdcard takes the
+# card away. Unmounting first left "File ... not found" every time: the most
+# natural place to keep an offline image was the one place it could not be read
+# from.
+reset_env
+mkdir -p "$SB/mnt/mmcblk0p1"
+make_combined "$SB/tmp/firmware.bin.ssc338q"
+make_archive "$SB/tmp/firmware.bin.ssc338q"
+rm -f "$SB/tmp/firmware.bin.ssc338q"
+mv "$SB/tmp/fw.tgz" "$SB/mnt/mmcblk0p1/fw.tgz"
+echo "/dev/mmcblk0p1 on $SB/mnt/mmcblk0p1 type vfat (rw,relatime)" > "$SDMOUNTS"
+STUB_UMOUNT_HIDES=1
+run -z --archive="$SB/mnt/mmcblk0p1/fw.tgz"
+u=$(at "Local archive unpacked"); c=$(at "Unmounting SD card")
+if [ "$RC" -eq 0 ] && [ -n "$u" ] && [ -n "$c" ] && [ "$u" -lt "$c" ] &&
+    [ -f "$SB/mnt/mmcblk0p1.unmounted/fw.tgz" ]; then
+    ok "an archive on the SD card is unpacked before the card is unmounted, and kept"
+else
+    bad "archive on the SD card, rc=$RC unpacked@${u:-none} unmount@${c:-none} out='$OUT'"
+fi
+rm -rf "$SB/mnt"
+
 # --- an image shorter than its own superblock -------------------------------
 #
 # Reported 2026-09-18: a gk7205v200 froze at "Erasing block: 62/64 (96%)" and
@@ -882,23 +957,128 @@ else
     bad "8487 KB into 8192 KB -> expected a refusal, rc=$RC out='$OUT'"
 fi
 
-# The advice has to be reachable. A WebUI run is the only one with majestic
-# still resident, so it is the only one told to go and use a shell; saying that
-# to somebody already in one would be noise.
-printf '%s' "$OUT" | grep -q "from ssh or the serial console" \
-    && ok "...and says where the missing memory is" \
-    || bad "a --web refusal should point at the shell path, out='$OUT'"
+# majestic is most of what is missing, on either path: in upgrade mode it locks
+# itself into RAM (11476 KB available on a gk7201v200, 18888 KB with it
+# stopped). Short of memory, a run stops it and asks again rather than refuse.
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=8691055
+STUB_MAJESTIC_PID=901 STUB_MEM_AFTER_STOP=16000
+run -z --web -k -r
+if grep -q "S95majestic stop" "$SB/tmp/flash.log" &&
+    ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack" &&
+    printf '%s' "$OUT" | grep -q "stopping it, which gives back what it holds in RAM" &&
+    printf '%s' "$OUT" | grep -q "This page loses the log here"; then
+    ok "a WebUI run short of memory stops majestic and goes on to unpack"
+else
+    bad "short + majestic running -> expected majestic stopped and no refusal, rc=$RC out='$OUT'"
+fi
 
 reset_env
 set_meminfo 8192
 STUB_DL_BYTES=8691055
+STUB_MAJESTIC_PID=901 STUB_MEM_AFTER_STOP=16000
 run -z -k -r
-if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "Not enough memory to unpack" &&
-    ! printf '%s' "$OUT" | grep -q "from ssh or the serial console"; then
-    ok "...but a console run is not told to go and find a console"
+if grep -q "S95majestic stop" "$SB/tmp/flash.log" &&
+    ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack" &&
+    ! printf '%s' "$OUT" | grep -q "This page loses the log"; then
+    ok "...and so does a console run, which is not told about a page it has not got"
 else
-    bad "a non-web refusal should not carry the --web advice, rc=$RC out='$OUT'"
+    bad "console run short + majestic running -> expected it stopped, rc=$RC out='$OUT'"
 fi
+
+# Still short with majestic stopped: refused as before, and majestic is put
+# back, since the camera is staying up.
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=8691055
+STUB_MAJESTIC_PID=901 STUB_MEM_AFTER_STOP=8300
+run -z --web -k -r
+if [ "$RC" -ne 0 ] && nothing_wrote &&
+    printf '%s' "$OUT" | grep -q "8300 KB free with majestic stopped" &&
+    grep -qx "S95majestic start" "$SB/tmp/flash.log"; then
+    ok "still short with majestic stopped -> refused, and majestic started again"
+else
+    bad "short even without majestic -> expected a refusal and a start, rc=$RC out='$OUT' log='$(cat "$SB/tmp/flash.log")'"
+fi
+# After the lock is gone, or the supervisor declines and the camera is left
+# with no majestic and no WebUI.
+if ! grep -q "under the upgrade lock" "$SB/tmp/flash.log" &&
+    [ "$(logged_at "S95majestic start")" -gt 0 ] 2>/dev/null; then
+    ok "...after the upgrade lock is released, so the supervisor starts it"
+else
+    bad "majestic must be started after the lock is released, log='$(cat "$SB/tmp/flash.log")'"
+fi
+# The page lost the log before the refusal, so the camera's log carries it.
+if grep -q "^logger .*upgrade refused, nothing was written: Not enough memory to unpack" "$SB/tmp/flash.log" &&
+    ! printf '%s' "$OUT" | grep -q "the camera reboots on its own once"; then
+    ok "...and the refusal goes to syslog, with no reboot promised before the retry"
+else
+    bad "a refusal after majestic was stopped must reach syslog, out='$OUT' log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# A stop that timed out freed nothing and took the supervisor: no retry on
+# memory that was never given back, and a restart, not a start, to bring the
+# video back.
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=8691055
+STUB_MAJESTIC_PID=901 STUB_MEM_AFTER_STOP=16000 STUB_STOP_FAILS=1
+run -z --web -k -r
+if [ "$RC" -ne 0 ] && nothing_wrote &&
+    printf '%s' "$OUT" | grep -q "majestic did not stop" &&
+    printf '%s' "$OUT" | grep -q "Not enough memory to unpack" &&
+    grep -qx "S95majestic restart" "$SB/tmp/flash.log"; then
+    ok "a stop that fails is not retried on, and majestic is restarted"
+else
+    bad "failed stop -> expected a refusal and a restart, rc=$RC out='$OUT' log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# A reading after the stop that will not parse is no reason to refuse, as the
+# first is not.
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=8691055
+STUB_MAJESTIC_PID=901 STUB_MEM_AFTER_STOP=unreadable
+run -z --web -k -r
+if grep -q "S95majestic stop" "$SB/tmp/flash.log" &&
+    ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "an unreadable /proc/meminfo after the stop is no opinion either"
+else
+    bad "unreadable meminfo after the stop -> expected no refusal, rc=$RC out='$OUT'"
+fi
+
+# Once majestic is stopped every way out must go through die(), which puts it
+# and the lock back -- an interrupt too, until the flash phase ignores them.
+awk '/^stop_majestic_for_memory\(\)/,/^}/' "$SRC" | grep -q "trap 'die .*' INT TERM HUP" \
+    && ok "an interrupt after majestic is stopped goes through die()" \
+    || bad "stop_majestic_for_memory must trap INT/TERM/HUP to die()"
+# ...but never once the flash phase has taken them away: the floor is asked
+# from inside enter_ramfs, and a die() from an interrupt there could reboot
+# the camera halfway through the erase (#2024).
+awk '/^stop_majestic_for_memory\(\)/,/^}/' "$SRC" | grep -B1 "trap 'die " | grep -q 'signals_ignored' \
+    && grep -A1 "^trap '' HUP INT TERM PIPE" "$SRC" | grep -q '^signals_ignored=1' \
+    && ok "...and leaves the flash phase's protection alone" \
+    || bad "the die() trap must not be installed once signals are ignored for the flash"
+
+# Never the majestic that pets the watchdog: nothing would pet it until the
+# RAM phase. /dev/null stands in for the device -- a character device the
+# sandbox can name -- and a fake /proc gives pid 4242 an fd on it.
+mkdir -p "$SB/wdproc/4242/fd"
+ln -sf /dev/null "$SB/wdproc/4242/fd/3"
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=8691055
+STUB_MAJESTIC_PID=4242 STUB_MEM_AFTER_STOP=16000
+WDOG=/dev/null WDOG_PROC="$SB/wdproc"
+run -z --web -k -r
+if [ "$RC" -ne 0 ] && ! grep -q "S95majestic stop" "$SB/tmp/flash.log" &&
+    printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "...but a majestic holding the watchdog is left running, and the run refused"
+else
+    bad "majestic owns the watchdog -> expected it left alone, rc=$RC out='$OUT' log='$(cat "$SB/tmp/flash.log")'"
+fi
+rm -rf "$SB/wdproc"
 
 # --- #2484: a builder device profile must not be traded for the generic image
 #
@@ -1566,6 +1746,89 @@ else
     bad "--no_ramfs -> expected no pivot but a normal flash, log='$(cat "$SB/tmp/flash.log")'"
 fi
 
+# A uClibc image has no ldd, so it staged busybox without a loader and the
+# re-exec into the RAM root died "not found" with nothing left to fall back to
+# (#2605). The staged root is now made to run something first; when it cannot,
+# that is a refusal to pivot, not a reboot.
+reset_env
+STUB_CHROOT_RC=1
+STUB_PIVOT_RC=0
+run -z --kernel="$K" --rootfs="$R"
+if grep -q "^chroot .*/ram .*/busybox true" "$SB/tmp/flash.log" &&
+    ! grep -q "pivot_root" "$SB/tmp/flash.log" && flashed /dev/mtd3 && rebooted; then
+    ok "a staged root that cannot run is not pivoted into; the flash goes on in place"
+else
+    bad "unrunnable ramfs -> expected no pivot and an in-place flash, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+STUB_CHROOT_RC=0
+STUB_PIVOT_RC=1
+
+# Which libraries to stage, read from the ELF when there is no ldd to ask.
+# Exercised on a fixture rather than the host's busybox, whose libraries live
+# wherever the host distribution keeps them.
+LIBFX="$SB/libfx"
+mkdir -p "$LIBFX/lib" "$LIBFX/usr/lib"
+: > "$LIBFX/lib/ld-uClibc-1.0.45.so"
+ln -sf ld-uClibc-1.0.45.so "$LIBFX/lib/ld-uClibc.so.0"
+: > "$LIBFX/lib/libuClibc-1.0.45.so"
+ln -sf libuClibc-1.0.45.so "$LIBFX/lib/libc.so.0"
+printf 'libgcc_s.so.1\n' > "$LIBFX/usr/lib/libgcc_s.so.1"
+# What `strings` sees in a uClibc busybox: PT_INTERP, then .dynstr. libm.so.0
+# is named but absent, standing in for anything that only looks like a library.
+printf '\177ELF\n%s\nlibc.so.0\nlibm.so.0\nbusybox: applet not found\n' \
+    "$LIBFX/lib/ld-uClibc.so.0" > "$LIBFX/busybox"
+# ...and the C library itself names libgcc_s, which it dlopens for unwinding.
+printf 'libgcc_s.so.1\n' >> "$LIBFX/lib/libuClibc-1.0.45.so"
+libs=$( exec 3>/dev/null; ELF_LIB_DIRS="$LIBFX/lib $LIBFX/usr/lib"
+    eval "$(awk '/^elf_libs\(\)/,/^}/' "$SRC")"
+    for f in $(elf_libs "$LIBFX/busybox"); do echo "$f"; elf_libs "$f"; done | sort -u )
+if printf '%s\n' "$libs" | grep -qx "$LIBFX/lib/ld-uClibc.so.0" &&
+    printf '%s\n' "$libs" | grep -qx "$LIBFX/lib/libc.so.0" &&
+    printf '%s\n' "$libs" | grep -qx "$LIBFX/usr/lib/libgcc_s.so.1" &&
+    ! printf '%s\n' "$libs" | grep -q "libm"; then
+    ok "without ldd, the loader and the libraries are read out of the ELF (#2605)"
+else
+    bad "elf_libs on a uClibc-shaped busybox gave: $(printf '%s ' $libs)"
+fi
+# busybox_libs keeps asking ldd first, and only an empty answer -- no ldd, or
+# one that fails -- sends it to the ELF.
+libs=$( exec 3>/dev/null; PATH="$SB/nolddbin:$PATH"; mkdir -p "$SB/nolddbin"
+    printf '#!/bin/sh\nexit 1\n' > "$SB/nolddbin/ldd"; chmod +x "$SB/nolddbin/ldd"
+    eval "$(awk '/^busybox_libs\(\)/,/^}/' "$SRC")"
+    elf_libs() { [ "$1" = /bin/busybox ] && echo /lib/ld-fallback.so.1; }
+    busybox_libs )
+[ "$libs" = "/lib/ld-fallback.so.1" ] \
+    && ok "an ldd that answers nothing falls back to reading the ELF" \
+    || bad "busybox_libs with a silent ldd gave '$libs'"
+
+# Where a local image is after the pivot: the old root sits at /mnt, so an SD
+# card at /mnt/mmcblk0p1 is /mnt/mnt/mmcblk0p1 from inside it (#2605). /tmp
+# alone is carried across whole.
+PAP_FN=$(awk '/^path_after_pivot\(\)/,/^}/' "$SRC")
+pap() ( exec 3>/dev/null; cd "${2:-/}"; eval "$PAP_FN"; path_after_pivot "$1" )
+mkdir -p "$SB/rel"
+if [ "$(pap /tmp/rootfs.squashfs.gm8135)" = "/tmp/rootfs.squashfs.gm8135" ] &&
+    [ "$(pap /mnt/mmcblk0p1/rootfs.squashfs.gm8135)" = "/mnt/mnt/mmcblk0p1/rootfs.squashfs.gm8135" ] &&
+    [ "$(pap /root/uImage)" = "/mnt/root/uImage" ] &&
+    [ -z "$(pap "")" ]; then
+    ok "a local image is looked for where the pivot put it; /tmp stays where it was"
+else
+    bad "path_after_pivot: /tmp->'$(pap /tmp/x)' /mnt/mmc->'$(pap /mnt/mmcblk0p1/x)' /root->'$(pap /root/x)'"
+fi
+case "$(pap rootfs.squashfs "$SB/rel")" in
+    /mnt/*/rel/rootfs.squashfs | /tmp/*/rel/rootfs.squashfs)
+        ok "a relative image path is made absolute before enter_ramfs leaves its cwd" ;;
+    *)  bad "relative path after the pivot: '$(pap rootfs.squashfs "$SB/rel")'" ;;
+esac
+# The first phase keeps flashing from the path it was given: only the RAM phase
+# adopts the rewritten one, so a pivot that fails still finds its images.
+awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -qE '^\s*(kernel|rootfs)_file=' \
+    && bad "enter_ramfs must not rewrite kernel_file/rootfs_file; the in-place fallback still needs them" \
+    || ok "a failed pivot falls back with the image paths it was given"
+grep -q 'kernel_file=\$ramfs_kernel_file' "$SRC" && grep -q 'rootfs_file=\$ramfs_rootfs_file' "$SRC" \
+    && ok "the RAM phase flashes from the paths as the pivot left them" \
+    || bad "the RAM phase must adopt ramfs_kernel_file/ramfs_rootfs_file"
+
 # A pivot that did not happen must still hand the old root back as it found it.
 # The shipped rootfs has no /ram, so the directory enter_ramfs makes lands in the
 # overlay's upper layer and stays there: every upgrade since the pivot landed
@@ -1583,6 +1846,57 @@ else
     bad "failed pivot left RAM_ROOT behind, log='$(cat "$SB/tmp/flash.log")'"
 fi
 rm -f "$SB/bin/rmdir"
+
+# --- RAM left once the flash phase is staged ---------------------------------
+#
+# A gk7201v200 upgraded through the WebUI with ~500 KB left at the pivot hung
+# at rootfs erase block 17 of 77: what was still running from the old root
+# faulted on the squashfs being erased, and nothing rebooted it. Short of the
+# floor the run is refused before anything moves -- not handed to the in-place
+# fallback, which would flash with even less in RAM.
+# rmdir stubbed for the reason the test above gives.
+stub rmdir 'echo "rmdir $*" >> "$FLASH_LOG"; exit 0'
+reset_env
+set_meminfo 1500
+run -z --kernel="$K" --rootfs="$R"
+rm -f "$SB/bin/rmdir"
+if [ "$RC" -ne 0 ] && nothing_wrote && ! rebooted &&
+    ! grep -q "pivot_root" "$SB/tmp/flash.log" &&
+    printf '%s' "$OUT" | grep -q "Not enough memory left to flash safely: 1500 KB"; then
+    ok "too little RAM left at the pivot refuses before anything is written"
+else
+    bad "short RAM at the pivot -> expected a refusal, rc=$RC out='$OUT' log='$(cat "$SB/tmp/flash.log")'"
+fi
+if grep -q "^rmdir .*/ram$" "$SB/tmp/flash.log"; then
+    ok "...and takes the staged RAM root back down"
+else
+    bad "a refused pivot left its RAM root behind, log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# The floor itself is enough.
+reset_env
+set_meminfo 2048
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -eq 0 ] && flashed /dev/mtd3 && rebooted &&
+    printf '%s' "$OUT" | grep -q "RAM left to flash from: 2048 KB"; then
+    ok "exactly the floor is let through, and the figure is logged"
+else
+    bad "RAM at the floor -> expected a flash, rc=$RC out='$OUT'"
+fi
+
+# Short at the pivot too, and majestic is what gives it back: the floor is
+# asked again with majestic stopped, and the run flashes.
+reset_env
+set_meminfo 1500
+STUB_MAJESTIC_PID=901 STUB_MEM_AFTER_STOP=4000
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -eq 0 ] && flashed /dev/mtd3 && rebooted &&
+    grep -q "S95majestic stop" "$SB/tmp/flash.log" &&
+    printf '%s' "$OUT" | grep -q "RAM left to flash from: 4000 KB with majestic stopped"; then
+    ok "short at the pivot -> majestic stopped, and the flash goes on"
+else
+    bad "short at the pivot with majestic running -> expected a flash, rc=$RC out='$OUT' log='$(cat "$SB/tmp/flash.log")'"
+fi
 
 # --- the pivot is entered only when it is needed (issue #2416) --------------
 #
@@ -1760,6 +2074,96 @@ if [ "$RC" -eq 0 ] && flashed /dev/mtd2 && flashed /dev/mtd3; then
 else
     bad "clean card -> expected the run to proceed, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
 fi
+
+# --- vigil, the NVR application, gives the card up and comes back -----------
+# vigil records to the card check_sdcard unmounts, and has no prepare endpoint
+# for free_resources to call, so it is stopped there. A run that refuses before
+# writing has to start it again -- and only once the lock is gone, or its
+# supervisor (S95vigil, like S95majestic) declines the start and the NVR stays
+# blank. A run that flashes leaves it to the reboot.
+cat > "$SB/etc/init.d/S95vigil" <<'STUB'
+#!/bin/sh
+if [ "$1" != stop ] && [ -f "$STUB_LOCK" ]; then
+    echo "S95vigil $1 (under the upgrade lock)" >> "$FLASH_LOG"
+else
+    echo "S95vigil $1" >> "$FLASH_LOG"
+fi
+[ "$1" = stop ] && [ -n "$STUB_VIGIL_STOP_FAILS" ] && exit 1
+exit 0
+STUB
+chmod +x "$SB/etc/init.d/S95vigil"
+
+reset_env
+STUB_VIGILD_PID=4242
+: > "$SD/autoupdate-rootfs.img"
+printf '/dev/mmcblk0p1 on %s type vfat (rw,relatime)\n' "$SD" > "$SDMOUNTS"
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && grep -qx "S95vigil stop" "$SB/tmp/flash.log" &&
+    grep -qx "S95vigil start" "$SB/tmp/flash.log" &&
+    [ "$(logged_at "S95vigil stop")" -lt "$(logged_at "S95vigil start")" ]; then
+    ok "a refused upgrade stops vigil for the card, then starts it again"
+else
+    bad "refused upgrade with vigil -> log='$(grep S95vigil "$SB/tmp/flash.log" | tr '\n' ';')'"
+fi
+if ! grep -q "S95vigil start (under the upgrade lock)" "$SB/tmp/flash.log"; then
+    ok "...after the lock is gone, so its supervisor starts it"
+else
+    bad "vigil was started under the upgrade lock; S95vigil declines that and the NVR stays blank"
+fi
+
+# Not running when the upgrade began -- stopped on purpose, or given up on
+# after a crash loop: left alone, and not started by a refused upgrade.
+reset_env
+printf '/dev/mmcblk0p1 on %s type vfat (rw,relatime)\n' "$SD" > "$SDMOUNTS"
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && ! grep -q "S95vigil" "$SB/tmp/flash.log"; then
+    ok "a vigil that was not running is neither stopped nor started by a refused upgrade"
+else
+    bad "vigil not running -> log='$(grep S95vigil "$SB/tmp/flash.log" | tr '\n' ';')'"
+fi
+
+# vigil's supervisor between two vigilds -- in a crash back-off, or starting
+# it again for a card that turned up -- has no vigild to find, but it is
+# vigil running all the same: left alone it would see the lock and give up.
+reset_env
+sleep 60 &
+supervisor_pid=$!
+echo "$supervisor_pid" > "$SB/tmp/vigil-supervise.pid"
+printf '/dev/mmcblk0p1 on %s type vfat (rw,relatime)\n' "$SD" > "$SDMOUNTS"
+run -z --kernel="$K" --rootfs="$R"
+kill "$supervisor_pid" 2>/dev/null
+rm -f "$SB/tmp/vigil-supervise.pid"
+if [ "$RC" -ne 0 ] && grep -qx "S95vigil stop" "$SB/tmp/flash.log" &&
+    grep -qx "S95vigil start" "$SB/tmp/flash.log"; then
+    ok "a supervisor with no vigild at that moment is stopped and started again too"
+else
+    bad "supervisor only -> rc=$RC log='$(grep S95vigil "$SB/tmp/flash.log" | tr '\n' ';')'"
+fi
+
+# A stop that fails has ended the supervisor already: a refused upgrade
+# restarts it rather than starting a vigild that never went away.
+reset_env
+STUB_VIGILD_PID=4242 STUB_VIGIL_STOP_FAILS=1
+printf '/dev/mmcblk0p1 on %s type vfat (rw,relatime)\n' "$SD" > "$SDMOUNTS"
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && grep -qx "S95vigil restart" "$SB/tmp/flash.log"; then
+    ok "a vigil that would not stop is restarted when the upgrade is refused"
+else
+    bad "failed vigil stop -> rc=$RC log='$(grep S95vigil "$SB/tmp/flash.log" | tr '\n' ';')'"
+fi
+rm -f "$SD/autoupdate-rootfs.img"
+
+reset_env
+STUB_VIGILD_PID=4242
+printf '/dev/mmcblk0p1 on %s type vfat (rw,relatime)\n' "$SD" > "$SDMOUNTS"
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -eq 0 ] && grep -qx "S95vigil stop" "$SB/tmp/flash.log" &&
+    ! grep -q "S95vigil start" "$SB/tmp/flash.log"; then
+    ok "an upgrade that flashes stops vigil and leaves its start to the reboot"
+else
+    bad "flashing upgrade with vigil -> rc=$RC log='$(grep S95vigil "$SB/tmp/flash.log" | tr '\n' ';')'"
+fi
+rm -f "$SB/etc/init.d/S95vigil"
 
 # --- majestic frees its video over the API (prepare / abort) ----------------
 # The order is: majestic stops video (prepare), the card is unmounted and the
@@ -2142,6 +2546,40 @@ else
     bad "stage 2 ubiblock order ${u:-none}/${k:-none}/${r:-none} log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
 fi
 
+# A hand-off lets go of the old root -- an SD card behind it included -- before
+# the first write, so an image there would be gone when the flash looks for it.
+# Only a path outside /tmp shows that, and the sandbox lives under /tmp.
+OUTSIDE=$(mktemp -d "${HOME:-/root}/.sysupgrade-test.XXXXXX" 2>/dev/null)
+case "$(realpath "${OUTSIDE:-/tmp}" 2>/dev/null)" in
+    /tmp/* | /tmp | "")
+        ok "hand-off with an image outside /tmp: skipped, no directory outside /tmp to stage one in" ;;
+    *)
+        reset_env; ubi_setup ubiblock
+        cp "$US" "$OUTSIDE/"
+        STUB_PIVOT_RC=0
+        run -z --kernel="$UK" --rootfs="$OUTSIDE/$(basename "$US")"
+        if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "copy it into /tmp" &&
+            nothing_ubi && ! handed_off && ! grep -q pivot_root "$SB/tmp/flash.log"; then
+            ok "hand-off: an image the old root takes with it is refused before anything moves (#2605)"
+        else
+            bad "hand-off with an image outside /tmp must be refused, rc=$RC log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
+        fi
+        # ...but only an image the run will write. On ubifs a --kernel beside
+        # --rootfs is dropped (the kernel is inside the rootfs), so where that
+        # one lives cannot matter.
+        reset_env; ubi_setup ubifs
+        make_fit_soc "$UFIT" gk7205v500
+        cp "$UFIT" "$OUTSIDE/"
+        STUB_PIVOT_RC=0
+        run -z --force_soc --kernel="$OUTSIDE/$(basename "$UFIT")" --rootfs="$UFS"
+        if handed_off && ! printf '%s' "$OUT" | grep -q "copy it into /tmp"; then
+            ok "hand-off: a --kernel the ubifs layout drops is not held against the run"
+        else
+            bad "ubifs: an unused --kernel outside /tmp must not refuse the run, rc=$RC log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
+        fi ;;
+esac
+[ -n "$OUTSIDE" ] && rm -rf "$OUTSIDE"
+
 # --- ubifs: the kernel is a file in the rootfs, so -k writes the rootfs
 reset_env; ubi_setup ubifs
 make_fit_soc "$UFIT" gk7205v500
@@ -2158,8 +2596,9 @@ reset_env; ubi_setup ubifs-kvol
 STUB_PIVOT_RC=0
 run -z --kernel="$UFIT" --rootfs="$UFS"
 if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "retired NAND layout with a separate kernel volume" &&
+    printf '%s' "$OUT" | grep -q "ipctool nand-migrate" &&
     nothing_ubi && ! handed_off && ! rebooted; then
-    ok "ubifs-kvol: refused before anything is touched, reinstall link given"
+    ok "ubifs-kvol: refused before anything is touched, nand-migrate and reinstall link given"
 else
     bad "ubifs-kvol must be refused, rc=$RC log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
 fi
@@ -2239,6 +2678,9 @@ if handed_off && nothing_ubi && [ -x "$SB/ram/sbin/init" ] && [ ! -e "$SB/ram/bi
     grep -q "_handoff=1" "$envf" 2>/dev/null && grep -q "_ramfs_phase=.1" "$envf" &&
     grep -q "ubi_rootfs_dev=./dev/ubi0_0" "$envf" && grep -q "sysupgrade.env" "$SB/ram/sbin/init"; then
     ok "ubifs: the RAM root is staged for PID 1 and SIGQUIT sent before any write"
+    printf '%s' "$OUT" | grep -q "SSH, the WebUI and every other login end here" &&
+        ok "ubifs: the hand-off says the session ends, rather than that it goes quiet" ||
+        bad "ubifs: hand-off must say the session ends, out='$OUT'"
 else
     bad "ubifs: hand-off staging, log='$(cat "$SB/tmp/flash.log")' init='$(cat "$SB/ram/sbin/init" 2>&1)' out='$OUT'"
 fi
@@ -2297,6 +2739,33 @@ if handed_off && ! printf '%s' "$OUT" | grep -q "Not enough memory"; then
     ok "...nor is ramfs on a kernel without CMA"
 else
     bad "ramfs /tmp without CMA must not be refused, rc=$RC out='$OUT'"
+fi
+
+# The RAM left at the pivot is counted the same way: 3000 KB "available", 2000
+# of it free CMA a ramfs kernel cannot use, is 1000 KB, under the floor.
+stub rmdir 'echo "rmdir $*" >> "$FLASH_LOG"; exit 0'
+reset_env
+stub_ramfs_tmp
+set_meminfo_cma 3000 2000
+run -z --kernel="$K" --rootfs="$R"
+rm -f "$SB/bin/stat" "$SB/bin/rmdir"
+if [ "$RC" -ne 0 ] && nothing_wrote && ! rebooted &&
+    printf '%s' "$OUT" | grep -q "RAM left to flash from: 1000 KB (free CMA not counted: 2000 KB)" &&
+    printf '%s' "$OUT" | grep -q "Not enough memory left to flash safely: 1000 KB"; then
+    ok "ramfs /tmp: free CMA is not counted at the pivot either"
+else
+    bad "ramfs /tmp + CMA at the pivot -> expected a refusal, rc=$RC out='$OUT'"
+fi
+
+# ...and a real tmpfs with the same numbers has its 3000 KB.
+reset_env
+set_meminfo_cma 3000 2000
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -eq 0 ] && flashed /dev/mtd3 &&
+    printf '%s' "$OUT" | grep -q "RAM left to flash from: 3000 KB$"; then
+    ok "...while a real tmpfs counts that CMA, and flashes"
+else
+    bad "tmpfs /tmp + CMA at the pivot must not be refused, rc=$RC out='$OUT'"
 fi
 
 # A run that must hand PID 1 over cannot fall back to flashing in place, so the
@@ -2361,6 +2830,62 @@ if [ -n "$u" ] && [ -n "$bk" ] && [ -n "$rm" ] && [ -n "$rs" ] && [ -n "$w" ] &&
     ok "stage 2: settings copied, volumes resized to the image, settings restored, then reboot"
 else
     bad "stage 2 order release/copy/rmvol/rsvol/write/mkvol/restore/reboot = ${u:-none}/${bk:-none}/${rm:-none}/${rs:-none}/${w:-none}/${mk:-none}/${rs2:-none}/${b:-none} log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
+fi
+
+# --- the rootfs write says how far it has got: busybox ubiupdatevol does not,
+# and a NAND flash otherwise sat silent through the one step that matters
+reset_env; ubi_setup ubifs
+STUB_UBI_SLOW=1
+RUN_ENV="$S2 update_rootfs=1 rootfs_file=$UFS"
+run
+if ubi_wrote "/dev/ubi0_0 $UFS" && rebooted &&
+    printf '%s\n' "$OUT" | grep -qE "^Written: [0-9]{1,2}% \([0-9.]+ of [0-9.]+ MB\)$" &&
+    printf '%s\n' "$OUT" | grep -q "^Written: 100%"; then
+    ok "stage 2: the rootfs write reports its progress, then 100%"
+else
+    bad "stage 2 progress, log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
+fi
+reset_env; ubi_setup ubifs
+STUB_UBI_SLOW=1 STUB_FLASHCP_FAIL=1
+RUN_ENV="$S2 update_rootfs=1 rootfs_file=$UFS"
+run
+if printf '%s' "$OUT" | grep -q "Writing $UFS to /dev/ubi0_0 failed" &&
+    ! printf '%s' "$OUT" | grep -q "Written: 100%" && ! grep -q "ubimkvol" "$SB/tmp/flash.log"; then
+    ok "stage 2: a failed write is still a failure behind the progress, and never reads 100%"
+else
+    bad "stage 2 failed write behind progress, log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
+fi
+reset_env; ubi_setup ubifs
+STUB_UBI_SLOW=1
+RUN_ENV="$S2 update_rootfs=1 rootfs_file=$UFS silent_update=1"
+run
+if ubi_wrote "/dev/ubi0_0 $UFS" && ! printf '%s' "$OUT" | grep -q "Written:"; then
+    ok "stage 2: under -s the WebUI gets set_progress's lines and nothing else"
+else
+    bad "stage 2 -s progress, out='$OUT'"
+fi
+
+# --- a handed-off flash phase logs to a file the console and nc both follow
+reset_env; ubi_setup ubifs
+FOLLOW_LOG="$SB/tmp/upgrade.log"; rm -f "$FOLLOW_LOG" "$FOLLOW_LOG.http"
+RUN_ENV="$S2 update_rootfs=1 rootfs_file=$UFS"
+run
+if grep -q "Flashing from RAM" "$FOLLOW_LOG" && grep -q "Unconditional reboot" "$FOLLOW_LOG" &&
+    grep -q "^tail -n +1 -f $FOLLOW_LOG" "$SB/tmp/flash.log" &&
+    grep -q "^nc -ll -p 80 -e $FOLLOW_LOG.http" "$SB/tmp/flash.log" && [ -x "$FOLLOW_LOG.http" ] &&
+    head -1 "$FOLLOW_LOG.http" | grep -qx '#!/bin/sh' && grep -q 'HTTP/1.0 200 OK' "$FOLLOW_LOG.http" &&
+    ubi_wrote "/dev/ubi0_0 $UFS" && rebooted; then
+    ok "stage 2: the log goes to a file, the console tails it and nc serves it"
+else
+    bad "stage 2 follow log, log='$(cat "$SB/tmp/flash.log")' follow='$(cat "$FOLLOW_LOG" 2>&1)' out='$OUT'"
+fi
+reset_env; ubi_setup ubifs
+RUN_ENV="$S2 update_rootfs=1 rootfs_file=$UFS"
+run
+if printf '%s' "$OUT" | grep -q "Flashing from RAM" && ! grep -qE "^(tail|nc) " "$SB/tmp/flash.log"; then
+    ok "stage 2: an empty FOLLOW_LOG leaves the output where it was"
+else
+    bad "stage 2 FOLLOW_LOG off, log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
 fi
 
 # --- -r with -n: the new overlay is the wipe; nothing is copied or restored
@@ -2537,6 +3062,90 @@ if printf '%s' "$OUT" | grep -q "SoC from the FIT kernel beside it: hi3516ev300"
 else
     bad "hi3516ev300 UBI-only, rc=$RC log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
 fi
+# --- a device profile and a local UBIFS archive ----------------------------
+# The rootfs cannot be read without mounting it, so on a device profile only a
+# download under the device's own name used to count, and every local archive
+# needed --force_soc -- which gives up the SoC check as well. The NAND FIT now
+# carries the build's BUILD_PLATFORM (openipc,platform in nand-fit.its).
+# The value follows an FDT property header as it does in a real FIT: token,
+# length, then the name offset, whose last byte here is printable ('A').
+make_fit_plat() {
+    make_fit_soc "$1" "$2"
+    printf '\0\0\0\3\0\0\0\100\0\0\0\101BUILD_PLATFORM=%s\0' "$3" >> "$1"
+}
+# hisi_profile_archive <FIT platform, or empty>: a profile camera and a local
+# archive whose FIT names that platform; the loose images are removed, so what
+# /tmp holds afterwards is what the run left there.
+hisi_profile_archive() {
+    reset_env; ubi_setup_hisi
+    set_platform hi3516ev300_ultimate_acme-cam1 ultimate
+    if [ -n "$1" ]; then make_fit_plat "$HFIT" hi3516ev300 "$1"; else make_fit_soc "$HFIT" hi3516ev300; fi
+    make_ubifs "$HFS"
+    make_archive "$HFIT" "$HFS"
+    rm -f "$HFIT" "$HFS"
+    STUB_PIVOT_RC=0
+}
+
+hisi_profile_archive hi3516ev300_ultimate_acme-cam1
+run -z --archive="$SB/tmp/fw.tgz"
+if printf '%s' "$OUT" | grep -q "Device profile from the FIT kernel beside it: hi3516ev300_ultimate_acme-cam1" &&
+    printf '%s' "$OUT" | grep -q "SoC from the FIT kernel beside it: hi3516ev300" &&
+    handed_off && [ ! -f "$SB/tmp/fw.tgz" ]; then
+    ok "device profile + local UBIFS archive whose FIT names the device -> proceeds, SoC still checked"
+else
+    bad "the device's own local archive should pass, rc=$RC log='$(cat "$SB/tmp/flash.log")' out='$OUT'"
+fi
+
+# Another device's image, and what the refusal leaves: the archive, to retry
+# from, and none of what it unpacked -- on a camera that was 17 MB of a 60 MB
+# tmpfs, and the archive itself was already gone. A file somebody else keeps
+# in /tmp is not the unpack's to remove.
+hisi_profile_archive hi3516ev300_ultimate_other-cam2
+echo theirs > "$SB/tmp/not-from-the-archive"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "Wrong platform" && nothing_ubi && ! handed_off &&
+    [ -f "$SB/tmp/fw.tgz" ] && [ ! -e "$HFIT" ] && [ ! -e "$HFS" ] &&
+    [ ! -e "$SB/tmp/openipc.md5sum" ] && [ -f "$SB/tmp/not-from-the-archive" ]; then
+    ok "device profile + another device's UBIFS archive -> refused; archive kept, unpacked images removed"
+else
+    bad "another device's archive, rc=$RC archive=$([ -f "$SB/tmp/fw.tgz" ] && echo kept || echo gone) left=$(ls "$SB/tmp" | tr '\n' ' ') out='$OUT'"
+fi
+rm -f "$SB/tmp/not-from-the-archive"
+
+# The record of an unpack belongs to the run that made it. A second sysupgrade
+# that fails before unpacking anything must not act on another run's list --
+# here one at the name an earlier draft used, naming an image that run is about
+# to flash.
+reset_env
+echo "fitImage.hi3516ev300" > "$SB/tmp/sysupgrade.unpacked"
+echo running > "$SB/tmp/fitImage.hi3516ev300"
+run -z --archive="$SB/tmp/no-such.tgz"
+if [ "$RC" -ne 0 ] && [ -f "$SB/tmp/fitImage.hi3516ev300" ]; then
+    ok "a run that unpacked nothing leaves another run's images alone"
+else
+    bad "a failed run removed what it did not unpack, rc=$RC out='$OUT'"
+fi
+rm -f "$SB/tmp/sysupgrade.unpacked" "$SB/tmp/fitImage.hi3516ev300"
+
+# A FIT from before it carried a platform is no evidence either way.
+hisi_profile_archive ""
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "names no platform" && nothing_ubi; then
+    ok "device profile + UBIFS archive whose FIT names no platform -> refused"
+else
+    bad "a FIT with no platform proves nothing, rc=$RC out='$OUT'"
+fi
+
+# --force_soc still takes it, as the refusal says.
+hisi_profile_archive hi3516ev300_ultimate_other-cam2
+run -z --force_soc --archive="$SB/tmp/fw.tgz"
+if handed_off && printf '%s' "$OUT" | grep -q "Skipping the rootfs SoC pre-check"; then
+    ok "device profile + another device's UBIFS archive + --force_soc -> proceeds"
+else
+    bad "--force_soc should still override, rc=$RC out='$OUT'"
+fi
+rm -f "$HFIT" "$HFS"
+
 default_url_is "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.hi3516ev300-nand-ultimate.tgz" \
     ubi_setup_hisi
 
@@ -2549,7 +3158,9 @@ default_url_is "$F/openipc.ssc338q-nor-ultimate.tgz" ubi_setup ubiblock
 reset_env; UBLOCK_SOC=gk7205v500 ubi_setup ubiblock
 STUB_PIVOT_RC=0
 run -z --kernel="$UK" --rootfs="$US"
+# nand-migrate needs a FIT U-Boot, which a ubiblock camera does not have
 if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "retired NAND layout with a separate kernel volume" &&
+    ! printf '%s' "$OUT" | grep -q "nand-migrate" &&
     nothing_ubi && ! handed_off && ! rebooted; then
     ok "ubiblock on gk7205v500: refused before anything is touched, reinstall link given"
 else
@@ -2594,7 +3205,11 @@ else
 fi
 
 # --- the unpack leaves rootfs.ubi (fresh-install image) in the archive
+# An image that passes, so the run reaches the hand-off with what it unpacked
+# still in /tmp: a refused one takes its unpack back (discard_unpacked).
 reset_env; ubi_setup ubifs
+make_fit_soc "$UFIT" gk7205v500
+STUB_PIVOT_RC=0
 stage="$SB/stage"; rm -rf "$stage"; mkdir -p "$stage"
 cp "$UFIT" "$UFS" "$stage/"
 dd if=/dev/zero bs=1k count=64 of="$stage/rootfs.ubi.gk7205v500" 2>/dev/null
@@ -2611,6 +3226,258 @@ fi
 
 # ---------------------------------------------------------------------------
 echo
+# --- the split NOR layout (Goke gk7205v200 family) ---------------------------
+# One "firmware" partition from 0x50000 to the end of the chip; the kernel
+# divides it at boot into the FIT, the squashfs after it and rootfs_data from
+# the squashfs end. sysupgrade writes firmware.bin through mtdblock and stages
+# the settings at the new overlay start, where /init restores them. The
+# mtdblock "devices" are sparse files here, so a test reads back what landed
+# where.
+
+# make_split_fw <file> <soc> <kernel blocks> <squashfs bytes_used>: a uImage
+# named for the SoC whose header and data end inside its last 64 KiB block,
+# then the squashfs at the next block, as post-image.sh packs firmware.bin.
+make_split_fw() {
+    local size=$(($3 * 65536 - 64 - 100))
+    printf '\x27\x05\x19\x56' > "$1"
+    dd if=/dev/zero bs=1 count=8 >> "$1" 2>/dev/null                  # 4..11
+    printf %b "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(((size >> 24) & 255)) \
+        $(((size >> 16) & 255)) $(((size >> 8) & 255)) $((size & 255)))" >> "$1"  # 12..15
+    dd if=/dev/zero bs=1 count=16 >> "$1" 2>/dev/null                 # 16..31
+    printf 'Linux-4.9.37-%s' "$2" >> "$1"                              # 32.. name
+    truncate -s $(($3 * 65536)) "$1"
+    make_squashfs "$SB/tmp/split.sqfs" "$4"
+    cat "$SB/tmp/split.sqfs" >> "$1"; rm -f "$SB/tmp/split.sqfs"
+    truncate -s $((($(stat -c %s "$1") + 65535) / 65536 * 65536)) "$1"
+}
+
+# set_split_mtd <layout> <chip bytes>: /proc/mtd, /sys/class/mtd and the
+# mtdblock files for "split" (firmware and the children the kernel made) or
+# "fixed" (kernel 2M, rootfs 5M, rootfs_data to the end, plus the overlapping
+# firmware alias the fixed-slot command line also carries). The children of
+# the split layout sit at the offsets an image of 30 + 40 blocks gives.
+set_split_mtd() {
+    local chip=$2 i=0 spec name off size
+    rm -rf "$SB/sys/class/mtd" "$SB/dev"; mkdir -p "$SB/sys/class/mtd" "$SB/dev"
+    printf 'dev:    size   erasesize  name\n' > "$SB/proc/mtd"
+    if [ "$1" = split ]; then
+        set -- u-boot:0:0x40000 env:0x40000:0x10000 firmware:0x50000:$((chip - 0x50000)) \
+            kernel:0x50000:0x1e0000 rootfs:0x230000:0x280000 \
+            rootfs_data:0x4b0000:$((chip - 0x4b0000))
+    else
+        set -- u-boot:0:0x40000 env:0x40000:0x10000 kernel:0x50000:0x200000 \
+            rootfs:0x250000:0x500000 firmware:0x50000:0x700000 \
+            rootfs_data:0x750000:$((chip - 0x750000))
+    fi
+    for spec in "$@"; do
+        name=${spec%%:*}; spec=${spec#*:}; off=$((${spec%%:*})); size=$((${spec#*:}))
+        mkdir -p "$SB/sys/class/mtd/mtd$i" "$SB/sys/class/mtd/mtd${i}ro"
+        echo "$name" > "$SB/sys/class/mtd/mtd$i/name"
+        echo "$off" > "$SB/sys/class/mtd/mtd$i/offset"
+        echo "$size" > "$SB/sys/class/mtd/mtd$i/size"
+        printf 'mtd%d: %08x 00010000 "%s"\n' "$i" "$size" "$name" >> "$SB/proc/mtd"
+        truncate -s "$size" "$SB/dev/mtdblock$i"
+        i=$((i + 1))
+    done
+}
+
+# split_env <layout> [chip]: a gk7205v200 running from that layout, its overlay
+# mounted in the sandbox with a marker in it, on a bootloader that boots the
+# split layout.
+split_env() {
+    reset_env
+    set_platform gk7205v200_lite
+    STUB_SOC=gk7205v200; STUB_IMG_SOC=gk7205v200; STUB_VENDOR=goke
+    set_split_mtd "$1" "${2:-0x800000}"
+    # What OpenIPC U-Boot passes on the split layout: nothing about the flash.
+    set_cmdline 'mem=32M console=ttyAMA0,115200 panic=20 rootfstype=squashfs init=/init mmz_allocator=gk'
+    rm -rf "$SB/overlay"; mkdir -p "$SB/overlay/etc"; echo kept > "$SB/overlay/etc/marker"
+    printf 'tmpfs %s/tmp tmpfs rw 0 0\n/dev/mtdblock5 %s/overlay jffs2 rw 0 0\n' "$SB" "$SB" \
+        > "$SB/proc/mounts"
+    # The MTD character devices read the same files: here the chip is what
+    # mtdblock wrote.
+    RUN_ENV="MTD_SYS=$SB/sys/class/mtd MTDBLOCK=$SB/dev/mtdblock MTDCHR=$SB/dev/mtdblock"
+    make_split_fw "$SB/tmp/firmware.bin.gk7205v200" gk7205v200 "${SPLIT_FIT_BLOCKS:-30}" \
+        "${SPLIT_SQ_USED:-$((40 * 65536 - 4000))}"
+    make_archive "$SB/tmp/firmware.bin.gk7205v200"
+}
+# The bytes at absolute flash offset $2 in mtdblock$1, which starts at $3.
+flash_at() { xxd -p -l "$4" -s $(($2 - $3)) "$SB/dev/mtdblock$1"; }
+# The settings blob at absolute offset $2 in mtdblock$1 (starting at $3): its
+# length field, and the files of the tar it carries.
+blob_len() { dd if="$SB/dev/mtdblock$1" bs=1 skip=$(($2 - $3 + 12)) count=12 2>/dev/null; }
+blob_files() {
+    local n=$((10#$(blob_len "$@")))
+    dd if="$SB/dev/mtdblock$1" bs=1 skip=$(($2 - $3 + 24)) count="$n" 2>/dev/null | tar tzf - 2>/dev/null
+}
+FW_HEAD=$(printf '27051956%08x' 0)
+OVL=$((0x50000 + 70 * 65536))
+
+split_env split
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -eq 0 ] && [ "$(flash_at 2 0x50000 0x50000 8)" = "$FW_HEAD" ] &&
+    [ "$(flash_at 2 $((0x50000 + 30 * 65536)) 0x50000 4)" = 68737173 ] &&
+    [ "$(dd if="$SB/dev/mtdblock2" bs=1 skip=$((OVL - 0x50000)) count=12 2>/dev/null)" = OPENIPC-OVL1 ] &&
+    blob_files 2 "$OVL" 0x50000 | grep -q 'etc/marker' && nothing_wrote && rebooted; then
+    ok "split layout: firmware.bin at 0x50000, the settings staged where rootfs_data will start"
+else
+    bad "split layout upgrade, rc=$RC head=$(flash_at 2 0x50000 0x50000 8) out='$OUT'"
+fi
+if printf '%s' "$OUT" | grep -q "Settings staged at $(printf 0x%x "$OVL")"; then
+    ok "split layout: the overlay offset is the FIT and the squashfs, each to 64 KiB"
+else
+    bad "split layout: expected the settings at $(printf 0x%x "$OVL"), out='$OUT'"
+fi
+
+# -n: a blob of length 0, which /init takes as "erase, restore nothing".
+split_env split
+run -z -n --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -eq 0 ] && [ "$(blob_len 2 "$OVL" 0x50000)" = 000000000000 ]; then
+    ok "split layout -n: an empty settings blob, so the first boot starts clean"
+else
+    bad "split layout -n, rc=$RC len='$(blob_len 2 "$OVL" 0x50000)' out='$OUT'"
+fi
+
+# From fixed slots: the image runs on from the kernel slot into the rootfs one,
+# and the settings land in the old rootfs, where the new rootfs_data starts.
+split_env fixed
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -eq 0 ] && [ "$(flash_at 2 0x50000 0x50000 8)" = "$FW_HEAD" ] &&
+    [ "$(flash_at 2 $((0x50000 + 30 * 65536)) 0x50000 4)" = 68737173 ] &&
+    [ "$(dd if="$SB/dev/mtdblock3" bs=1 skip=$((OVL - 0x250000)) count=12 2>/dev/null)" = OPENIPC-OVL1 ] &&
+    blob_files 3 "$OVL" 0x250000 | grep -q 'etc/marker' &&
+    [ "$(xxd -p -l 4 "$SB/dev/mtdblock4")" = 00000000 ] && nothing_wrote; then
+    ok "fixed slots -> split: written across kernel and rootfs, the firmware alias left alone"
+else
+    bad "fixed -> split, rc=$RC out='$OUT'"
+fi
+
+# The same under an older bootloader, which spells out the fixed slots: any
+# U-Boot that loads the kernel from 0x50000 boots the split layout, since the
+# kernel finds its own partitions, so nothing about the bootloader is asked.
+split_env fixed
+set_cmdline 'mem=32M console=ttyAMA0,115200 panic=20 rootfstype=squashfs root=/dev/mtdblock3 init=/init mtdparts=sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data) mmz_allocator=gk'
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -eq 0 ] && [ "$(flash_at 2 0x50000 0x50000 8)" = "$FW_HEAD" ] && rebooted; then
+    ok "split image under an older bootloader's fixed-slot command line: installed"
+else
+    bad "split image under an older bootloader must install, rc=$RC out='$OUT'"
+fi
+
+# An image that leaves no block for the settings is refused before the write.
+SPLIT_SQ_USED=$((93 * 65536)) split_env split
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "settings do not fit" &&
+    [ "$(xxd -p -l 4 "$SB/dev/mtdblock2")" = 00000000 ] && nothing_wrote; then
+    ok "split layout: an image that fills the flash is refused, nothing written"
+else
+    bad "split layout: an oversized image must be refused, rc=$RC out='$OUT'"
+fi
+
+# Another SoC's image: refused before anything is written.
+split_env split
+make_split_fw "$SB/tmp/firmware.bin.gk7205v200" gk7205v300 30 $((40 * 65536 - 4000))
+make_archive "$SB/tmp/firmware.bin.gk7205v200"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && [ "$(xxd -p -l 4 "$SB/dev/mtdblock2")" = 00000000 ] && nothing_wrote &&
+    ! rebooted; then
+    ok "split layout: another SoC's firmware.bin is refused before the pivot, nothing written, no reboot"
+else
+    bad "split layout: wrong SoC must be refused, rc=$RC out='$OUT'"
+fi
+# Bytes past the squashfs: not what post-image.sh packs, and they would run
+# into the settings. Refused before anything moves.
+split_env split
+head -c 131072 /dev/urandom >> "$SB/tmp/firmware.bin.gk7205v200"
+make_archive "$SB/tmp/firmware.bin.gk7205v200"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "runs past the end of its squashfs" &&
+    [ "$(xxd -p -l 4 "$SB/dev/mtdblock2")" = 00000000 ] && nothing_wrote && ! rebooted; then
+    ok "split layout: a firmware.bin with bytes past its squashfs is refused, no reboot"
+else
+    bad "split layout: trailing bytes must be refused, rc=$RC out='$OUT'"
+fi
+
+# Settings that do not fit what the image leaves: refused before the pivot.
+SPLIT_SQ_USED=$((92 * 65536)) split_env split
+head -c 200000 /dev/urandom > "$SB/overlay/etc/noise"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "settings do not fit" &&
+    [ "$(xxd -p -l 4 "$SB/dev/mtdblock2")" = 00000000 ] && nothing_wrote && ! rebooted; then
+    ok "split layout: settings too big for the space left are refused before the pivot"
+else
+    bad "split layout: oversized settings must be refused unwritten, rc=$RC out='$OUT'"
+fi
+
+# Any other combined image on a camera already on the split layout: its
+# "firmware" partition is the whole flash after env.
+split_env split
+make_combined "$SB/tmp/firmware.bin.gk7205v200"
+make_archive "$SB/tmp/firmware.bin.gk7205v200"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "not a split-layout firmware.bin" &&
+    [ "$(xxd -p -l 4 "$SB/dev/mtdblock2")" = 00000000 ] && nothing_wrote && ! rebooted; then
+    ok "split layout: a combined image of another shape is refused, nothing written"
+else
+    bad "split layout: a non-split combined image must be refused, rc=$RC out='$OUT'"
+fi
+
+# What mtdblock accepted is not what reached the chip (its cache was never
+# written out): the read back through the MTD character device says so, and the
+# run does not report the firmware written.
+split_env split
+mkdir -p "$SB/stale"
+for i in 0 1 2 3 4 5; do truncate -s "$(stat -c %s "$SB/dev/mtdblock$i")" "$SB/stale/mtd$i"; done
+RUN_ENV="$RUN_ENV MTDCHR=$SB/stale/mtd"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "does not read back as the image" &&
+    ! printf '%s' "$OUT" | grep -q "Firmware updated"; then
+    ok "split layout: a write that never reached the chip is caught by the read-back"
+else
+    bad "split layout: a stale chip must fail the write, rc=$RC out='$OUT'"
+fi
+rm -rf "$SB/stale"
+
+# A camera on the split layout has no slots for a separate kernel and rootfs.
+split_env split
+make_uimage "$SB/tmp/uImage.gk7205v200" gk7205v200
+make_rootfs "$SB/tmp/rootfs.squashfs.gk7205v200"
+rm -f "$SB/tmp/firmware.bin.gk7205v200"
+run -z --kernel="$SB/tmp/uImage.gk7205v200" --rootfs="$SB/tmp/rootfs.squashfs.gk7205v200"
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "openipc.gk7205v200-nor-lite-split.tgz" &&
+    nothing_wrote && [ "$(xxd -p -l 4 "$SB/dev/mtdblock2")" = 00000000 ] && ! rebooted; then
+    ok "split layout: a separate kernel and rootfs are refused, the -split archive named"
+else
+    bad "split layout: kernel+rootfs must be refused, rc=$RC out='$OUT'"
+fi
+unset STUB_SOC STUB_IMG_SOC STUB_VENDOR
+rm -rf "$SB/overlay" "$SB/dev"
+
+# The default URL: the -split archive for the family, whatever the bootloader;
+# every other SoC keeps the plain package.
+default_url_is "$F/openipc.gk7205v200-nor-lite-split.tgz" \
+    eval 'set_platform gk7205v200_lite; STUB_SOC=gk7205v200'
+default_url_is "$F/openipc.ssc338q-nor-lite.tgz" true
+# --channel resolves the plain package from the manifest; the family fetches
+# the -split one beside it.
+printf '@channel stable nightly-1\nnightly-1 gk7205v200_lite nor %s\nnightly-1 ssc338q_lite nor %s\n' \
+    "$F/openipc.gk7205v200-nor-lite.tgz" "$F/openipc.ssc338q-nor-lite.tgz" > "$SB/manifest.flat"
+for c in gk7205v200 ssc338q; do
+    reset_env; set_meminfo 8192; STUB_DL_BYTES=8691055
+    set_platform ${c}_lite; STUB_SOC=$c
+    RUN_ENV="STUB_MANIFEST=$SB/manifest.flat"
+    run -z --channel=stable
+    want="$F/openipc.$c-nor-lite.tgz"
+    [ "$c" = gk7205v200 ] && want="$F/openipc.gk7205v200-nor-lite-split.tgz"
+    if printf '%s' "$OUT" | grep -qF "Download from $want" && nothing_wrote; then
+        ok "--channel, $c -> $want"
+    else
+        bad "--channel, $c: expected 'Download from $want', rc=$RC out='$OUT'"
+    fi
+done
+rm -f "$SB/manifest.flat"
+unset STUB_SOC
+
 echo "=== Part 2: invariants in $SRC ==="
 
 # An option named in a user-facing message must exist in the parser.
@@ -2637,9 +3504,14 @@ awk '/^create_lock\(\)/,/^}/' "$SRC" | grep -q 'lock_owned=1' \
 awk '/^die\(\)/,/^}/' "$SRC" | grep -q 'restore_resources' \
     && ok "die() restarts the services free_resources stopped" \
     || bad "a pre-flash die() leaves syslog/klogd/ntpd/cron stopped on a camera that stays up"
-awk '/^restore_resources\(\)/,/^}/' "$SRC" | grep -q 'S95majestic restart' \
+awk '/^restore_resources\(\)/,/^}/' "$SRC" | grep -q 'majestic_pending=restart' \
+    && awk '/^restore_majestic\(\)/,/^}/' "$SRC" | grep -q 'S95majestic "$majestic_pending"' \
     && ok "restore_resources restarts majestic rather than starting it" \
     || bad "SIGQUIT leaves majestic running without an SDK; 'start' is a no-op, it needs 'restart'"
+# ...and only once the lock is gone, which the supervisor waits for.
+awk '/^die\(\)/,/^}/' "$SRC" | awk '/rm -f \$LOCK_FILE/ { l = NR } /restore_majestic/ { m = NR } END { exit !(l && m > l) }' \
+    && ok "die() brings majestic back after releasing the lock" \
+    || bad "die() must call restore_majestic after removing \$LOCK_FILE"
 # The breadcrumb pair (#2415, #2417). Its whole value rests on ORDER: the line
 # has to leave before syslogd stops, or a camera that never comes back takes the
 # explanation with it. A later reshuffle of free_resources() that moved the
@@ -2680,9 +3552,21 @@ awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -q '^\s*exec ' \
 awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -q 'chroot' \
     && ok "enter_ramfs chroots (pivot_root alone does not move this process's root)" \
     || bad "enter_ramfs must chroot after pivot_root"
-awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -q 'ldd ' \
+awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -q 'busybox_libs' \
     && ok "enter_ramfs stages the shared libraries busybox needs" \
     || bad "busybox is dynamically linked; staging it without its libs gives an unrunnable ramfs"
+# ...and the same list is what the RAM check counts, or a uClibc camera is
+# measured for a stage it is not given.
+awk '/^ramfs_stage_kb\(\)/,/^}/' "$SRC" | grep -q 'busybox_libs' \
+    && ok "ramfs_stage_kb counts what enter_ramfs stages" \
+    || bad "ramfs_stage_kb must count busybox_libs, the list enter_ramfs copies"
+# The probe that the staged root runs has to come before anything moves: after
+# the pivot a missing loader is an exec with no root left to return to (#2605).
+c=$(awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -n 'chroot "\$RAM_ROOT" /bin/busybox true' | head -1 | cut -d: -f1)
+m=$(awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -n 'mount -o move /dev' | head -1 | cut -d: -f1)
+[ -n "$c" ] && [ -n "$m" ] && [ "$c" -lt "$m" ] \
+    && ok "enter_ramfs proves the staged root runs before it moves a mount" \
+    || bad "enter_ramfs must chroot-probe the staged root before the mount moves (probe=${c:-none} move=${m:-none})"
 for m in /dev /proc /tmp; do
     awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -q "mount -o move $m" \
         && ok "enter_ramfs carries $m into the new root" \
@@ -2834,14 +3718,16 @@ fi
 # Every flashcp the script runs has to have its status read. A bare call
 # discards it and a pipeline hides it; either way a write that never happened is
 # announced as one that did (#2426).
-# write_image is the one place a write is not guarded on its own line: its
-# set_progress IS its return status, and its callers carry the `||` instead.
-wi_lines=$(awk '/^write_image\(\)/,/^}/ { print NR }' "$SRC")
+# write_image and ubi_update are the places a write is not guarded on its own
+# line: the write IS their return status, and their callers carry the `||`.
+wi_lines=$(awk '/^(write_image|ubi_update)\(\)/,/^}/ { print NR }' "$SRC")
 if grep -n 'set_progress \(flash\|ubiupdatevol\)' "$SRC" | grep -v '||' |
     grep -qvE "^($(echo $wi_lines | tr ' ' '|')):"; then
     bad "an unguarded set_progress write: $(grep -n 'set_progress \(flash\|ubiupdatevol\)' "$SRC" | grep -v '||')"
 elif grep -n 'write_image "' "$SRC" | grep -qv '||'; then
     bad "an unguarded write_image call: $(grep -n 'write_image "' "$SRC" | grep -v '||')"
+elif grep -n 'ubi_update "' "$SRC" | grep -v '||' | grep -qvE "^($(echo $wi_lines | tr ' ' '|')):"; then
+    bad "an unguarded ubi_update call: $(grep -n 'ubi_update "' "$SRC" | grep -v '||')"
 else
     ok "every flashcp/flash_eraseall write is followed by a status check"
 fi
